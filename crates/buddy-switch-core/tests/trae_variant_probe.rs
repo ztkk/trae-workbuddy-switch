@@ -113,6 +113,25 @@ fn probe_real_machine_variant_detection() {
                 ext.iter().any(|e| e == "trae.ai-code-completion"));
         }
     }
+
+    println!("\n=== 程序位级入口的入参解析（`trae_oauth_start` / `trae_launch_client`） ===");
+    // 这一节回答的是「前端传区域标识时，后端到底去操作**哪个客户端**」。
+    // 前端唯一持有的轴是**区域**（作用域 URL `/s/trae-cn/…` ⇒ 它传 `"cn"`），
+    // 若它被解析成 `TraeWork` 而本机只剩合并版 `Trae CN`，登录/启动就会以
+    // 「未检测到【TraeWork CN】客户端」失败 —— 按钮写 `Trae CN`（区域名）、
+    // 报错写 `TraeWork CN`（程序位名），那个错位正是本节的判据。
+    // `"trae_work"` 等**显式程序位**行必须与上面「各变体安装探测」一节逐字一致
+    // （点名的程序位不因没装而换一条）；只有 `"cn"` / `"global"` 那两行会挑程序位。
+    for token in ["cn", "global", "trae_work", "trae_cn", "trae", "trae_merged"] {
+        let resolved =
+            buddy_switch_core::modules::trae::handlers::variant_for_program_entry(Some(token));
+        println!(
+            "入参 variant={token:?} → {resolved:?} ({}) 已安装={} 写侧数据目录={:?}",
+            resolved.display_name(),
+            platform::detect_install_for(resolved).installed,
+            platform::detect_data_dir_for(resolved).map(|p| p.display().to_string()),
+        );
+    }
 }
 
 /// 列出该 userData 下 `logs/*/window*/exthost/*` 的一级目录名（去重、排序）。

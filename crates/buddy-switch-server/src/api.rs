@@ -2924,11 +2924,17 @@ async fn api_trae_import_local(Json(body): Json<Value>) -> Response {
 ///
 /// 变体必须**透传到 core**：授权 URL 的设备身份、会话归属、成功后落库的账号库
 /// 全部由它决定；在这里丢弃它会让两条产品线的登录互相串号。
+///
+/// ⚠️ 本入口的 `variant` 是**程序位**级参数 ⇒ 解析走
+/// [`trae::handlers::variant_for_program_entry`]，**不是** `parse_variant_param`：
+/// 前端唯一持有的轴是**区域**（作用域 URL `/s/trae-cn/…` ⇒ 它传 `"cn"`），
+/// 区域标识必须在这里落地到该区域**实际装着**的程序位 —— 交给 `parse_variant_param`
+/// 会让 `"cn"` 恒等于 `TraeWork`，在已合并的机器上报「未检测到客户端」。
 async fn api_trae_oauth_start(Json(body): Json<Value>) -> Response {
     if let Err(error) = require_capability(Product::Trae, capability::Capability::Oauth) {
         return json_err(error, StatusCode::FORBIDDEN);
     }
-    let variant = trae::handlers::parse_variant_param(&body);
+    let variant = trae::handlers::variant_for_program_entry(body.get("variant").and_then(Value::as_str));
     match trae::handlers::oauth_login_start_for(variant).await {
         Ok(value) => json_ok(value),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
@@ -3404,8 +3410,10 @@ async fn api_trae_open_data_dir(Json(body): Json<Value>) -> Response {
 }
 
 /// POST /api/trae/launch-client —— 启动该变体的 Trae 客户端（OAuth 的前置动作）。
+///
+/// ⚠️ 解析同 [`api_trae_oauth_start`]：区域标识落地到该区域实际装着的程序位。
 async fn api_trae_launch_client(Json(body): Json<Value>) -> Response {
-    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    let variant = trae::handlers::variant_for_program_entry(body.get("variant").and_then(Value::as_str));
     match trae::handlers::launch_client_for(variant) {
         Ok(value) => json_ok(value),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),

@@ -213,6 +213,48 @@ pub fn detect_install_for(variant: super::variant::TraeVariant) -> InstallProbe 
     }
 }
 
+/// 区域内程序位的**偏好序**：合并版在前、遗留 TraeCode 次之、遗留 TraeWork 最后。
+///
+/// ## 为什么合并版必须排第一
+///
+/// 客户端 2026-10-13 把 TraeWork 并入合并版（`TRAE SOLO CN` 被卸载、数据并入
+/// `Trae CN`，见 [`super::region::TraeProgram::Trae`] 的实测证据）。而在**已合并**的
+/// 机器上，合并版与遗留 TraeCode 的候选名**逐字相同**（`Trae CN` / `Trae CN.exe`）
+/// ⇒ 两条程序位的 [`detect_install_for`] **都会报已安装**，可真正的客户端只有一个。
+/// 此时若按程序表原序（TraeWork → TraeCode → 合并版）取首个装着的，就会落在
+/// **遗留 TraeCode** 上，界面上「探测到的是哪条产品线」于是说 TraeCode 而不是 Trae
+/// —— 用户已经因为这类错位报过一次障（同 [`super::variant::all_specs`] 的顺序理由）。
+///
+/// 抽成独立函数是为了**可测**：候选顺序是纯数据，一条断言就能钉住它
+/// （见 `区域内程序位偏好序把合并版排第一`）。
+pub fn region_program_preference(region: super::region::TraeRegion) -> [super::variant::TraeVariant; 3] {
+    // `TraeProgram::all()` 是「遗留两条在前、合并版在后」⇒ 反序即本函数的偏好序。
+    let mut programs = super::region::TraeProgram::all();
+    programs.reverse();
+    programs.map(|program| variant_for_program(region, program))
+}
+
+/// 该区域**实际装着**的程序位。
+///
+/// ## 用途：把「只说了区域、没说程序位」的入参落到一条真实存在的客户端上
+///
+/// 程序位级入口（OAuth 登录 / 启动客户端）需要一条**程序位**，而调用方常常只报得出
+/// **区域**（前端唯一持有的轴是作用域 URL `/s/trae-cn/…`）。这时必须由我们把区域
+/// 落地成一条装着的程序位，否则 `"cn"` 会按宽容别名恒等于 `TraeWork` ——
+/// 而它在已合并的机器上并不存在（见
+/// [`super::handlers::variant_for_program_entry`] 的缺陷说明）。
+///
+/// ## 不编造事实
+///
+/// 判据就是 [`detect_install_for`]；一个都没装时返回该区域的**主程序位**
+/// （遗留 TraeWork，改造前的默认），好让下游的「未检测到【…】客户端」文案有名字可报。
+pub fn installed_variant_in_region(region: super::region::TraeRegion) -> super::variant::TraeVariant {
+    region_program_preference(region)
+        .into_iter()
+        .find(|variant| detect_install_for(*variant).installed)
+        .unwrap_or_else(|| variant_for_program(region, super::region::TraeProgram::TraeWork))
+}
+
 /// 「该变体没有数据目录」时的**用户可读原因**。
 ///
 /// ## 为什么必须有它（2026-09-24 用户报障原话）
@@ -2970,5 +3012,87 @@ mod tests {
         assert_eq!(probe.exe.as_deref(), Some(exe.as_path()));
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// ★★ 区域内程序位的偏好序必须把**合并版**排第一。
+    ///
+    /// 现场：客户端 2026-10-13 把 TraeWork 并入合并版，`TRAE SOLO CN` 被卸载。
+    /// 在**已合并**的机器上，合并版与遗留 TraeCode 的候选名**逐字相同**
+    /// （`Trae CN` / `Trae CN.exe`）⇒ 两条程序位的探测**都会说已安装**，
+    /// 可真正的客户端只有一个。此时若按程序表原序取首个装着的，就会落在遗留
+    /// TraeCode 上，界面上「探测到的是哪条产品线」于是把合并版说成 TraeCode
+    /// —— 用户已因这类错位报过一次障（同 [`super::variant::all_specs`] 的顺序理由）。
+    ///
+    /// 反例（改坏会红）：删掉 `region_program_preference` 里的 `reverse()`。
+    #[test]
+    fn 区域内程序位偏好序把合并版排第一() {
+        use super::super::region::TraeRegion;
+        use super::super::variant::TraeVariant;
+
+        let cn = region_program_preference(TraeRegion::Cn);
+        assert_eq!(
+            cn,
+            [
+                TraeVariant::TraeMerged,
+                TraeVariant::Trae,
+                TraeVariant::TraeWork
+            ],
+            "CN 偏好序必须是「合并版 → 遗留 TraeCode → 遗留 TraeWork」"
+        );
+        let global = region_program_preference(TraeRegion::Global);
+        assert_eq!(
+            global,
+            [
+                TraeVariant::GlobalTraeMerged,
+                TraeVariant::GlobalTraeCode,
+                TraeVariant::Global
+            ],
+            "国际区域同形：合并版在前"
+        );
+
+        // 前置：同区域内三条两两不同，否则本用例会**恒真**（重复项挑不出错）。
+        // 这个前提真的会破：`TraeMerged` 与 `Trae` 候选名逐字相同，
+        // 若谁把 `variant_for_program` 改成按候选名反查，两条会撞成一条。
+        for (i, a) in cn.iter().enumerate() {
+            for b in cn.iter().skip(i + 1) {
+                assert_ne!(a, b, "CN 偏好序里出现重复项");
+            }
+        }
+
+        // ★ 偏好序**绝不跨区域**：跨了就会把国际版的登录落到国内客户端上。
+        for variant in cn {
+            assert_eq!(variant.region(), TraeRegion::Cn);
+        }
+        for variant in global {
+            assert_eq!(variant.region(), TraeRegion::Global);
+        }
+    }
+
+    /// ★ `installed_variant_in_region` 只回答「这个区域装着哪条」，**不编造事实**。
+    ///
+    /// 两条断言都与「本机装了什么」无关，因此三平台 CI 上同样成立：
+    /// - 结果必属该区域（跨区域 = 把登录态写进另一个账号体系的客户端）；
+    /// - 结果要么**真的装着**，要么是该区域的主程序位兜底（一个都没装时的报错口径）。
+    #[test]
+    fn installed_variant_in_region_stays_in_region_and_never_fakes_installed() {
+        use super::super::region::{TraeProgram, TraeRegion};
+
+        // `detect_install_for` 内部会读 settings（落 `BUDDY_SWITCH_HOME`），
+        // 与其它读环境的用例一样持 `env_lock()`，免得被并发改走 home 造成假失败。
+        let _lock = crate::modules::config::env_lock();
+
+        for region in TraeRegion::all() {
+            let resolved = installed_variant_in_region(region);
+            assert_eq!(
+                resolved.region(),
+                region,
+                "区域解析结果跨了区域：{region:?} → {resolved:?}"
+            );
+            let main_program = variant_for_program(region, TraeProgram::TraeWork);
+            assert!(
+                detect_install_for(resolved).installed || resolved == main_program,
+                "{region:?} 解析出 {resolved:?}，但它既没装、也不是该区域的主程序位兜底"
+            );
+        }
     }
 }

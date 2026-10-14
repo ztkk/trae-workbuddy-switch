@@ -2753,10 +2753,19 @@ pub async fn trae_import_local_account(variant: Option<String>) -> Result<Value,
 ///
 /// `variant` 可选：缺失 / 无法识别回落默认变体，保证老调用点行为不变。
 /// 命令名不变，仅新增参数。
+///
+/// ⚠️ 本入口的 `variant` 是**程序位**级参数，解析走
+/// [`trae::handlers::variant_for_program_entry`]：前端唯一持有的轴是**区域**
+/// （作用域 URL `/s/trae-cn/…` ⇒ 它传 `"cn"`），区域标识在这里落地到该区域
+/// **实际装着**的程序位，否则 `"cn"` 会被读成 `TraeWork` 而在已合并的机器上报
+/// 「未检测到客户端」（见该函数的说明）。
 #[tauri::command]
 pub async fn trae_oauth_start(variant: Option<String>) -> Result<Value, String> {
     require_capability(Product::Trae, capability::Capability::Oauth)?;
-    trae::handlers::oauth_login_start_for(parse_trae_variant(variant.as_deref())).await
+    trae::handlers::oauth_login_start_for(trae::handlers::variant_for_program_entry(
+        variant.as_deref(),
+    ))
+    .await
 }
 
 /// POST /api/trae/oauth/status —— 轮询登录结果。
@@ -3134,9 +3143,11 @@ pub fn open_trae_data_dir(variant: Option<String>) -> Result<Value, String> {
 /// 客户端从没启动过时，它的 `storage.json` 里没有 icube 设备凭证，OAuth 网页登录
 /// 必然以 `dataDirMissing` 失败。这个命令让用户**一键**跨过这道前置条件
 /// （动机与「启动成功 ≠ 凭证已就绪」的边界见 `handlers::launch_client_for`）。
+///
+/// ⚠️ 解析同 [`trae_oauth_start`]：区域标识落地到该区域实际装着的程序位。
 #[tauri::command]
 pub fn trae_launch_client(variant: Option<String>) -> Result<Value, String> {
-    trae::handlers::launch_client_for(parse_trae_variant(variant.as_deref()))
+    trae::handlers::launch_client_for(trae::handlers::variant_for_program_entry(variant.as_deref()))
 }
 
 /// GET /api/trae/gateway/logs —— 最近 N 条请求日志（元数据）。
