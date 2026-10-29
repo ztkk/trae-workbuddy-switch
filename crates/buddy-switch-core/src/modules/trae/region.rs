@@ -100,6 +100,17 @@ pub enum TraeRegion {
     Global,
 }
 
+/// **纯区域标识**词表（国内版一侧）。
+const CN_TOKENS: &[&str] = &["cn", "china", "domestic"];
+
+/// **纯区域标识**词表（国际版一侧）。
+const GLOBAL_TOKENS: &[&str] = &["global", "intl", "international", "sg", "ai"];
+
+/// 历史**产品线（程序位）**标识 —— 两者都是国内构建，读作国内区域。
+///
+/// 与上面两张表分开放，是因为它们**带程序位信息**：见 [`TraeRegion::is_region_token`]。
+const LEGACY_CN_PROGRAM_TOKENS: &[&str] = &["trae_work", "trae_cn", "traework", "trae"];
+
 impl TraeRegion {
     /// 稳定标识（文件名后缀、序列化、前端传参）。
     pub fn as_str(self) -> &'static str {
@@ -107,6 +118,21 @@ impl TraeRegion {
             TraeRegion::Cn => "cn",
             TraeRegion::Global => "global",
         }
+    }
+
+    /// 这个 token 是不是**纯区域标识**（只说区域、没说程序位）。
+    ///
+    /// ## 与 [`TraeRegion::parse`] 的分工（别混用）
+    ///
+    /// `parse` 为兼容老链接还接受 `trae_work` / `trae_cn` / `trae` 这类**历史产品线
+    /// （程序位）**标识，而它们**带程序位信息**。因此需要「只有区域、没有程序位」
+    /// 这个判据的地方（程序位级入口的入参解析，见
+    /// [`super::handlers::variant_for_program_entry`]）必须走本函数：
+    /// 把 `trae_work` 读成「用户只说了国内版」，会让「用户点名了 TraeWork 但它没装」
+    /// 被悄悄换成另一个客户端 —— 登录态就会写进错的客户端。
+    pub fn is_region_token(s: &str) -> bool {
+        let lowered = s.trim().to_ascii_lowercase();
+        CN_TOKENS.contains(&lowered.as_str()) || GLOBAL_TOKENS.contains(&lowered.as_str())
     }
 
     /// Trae 侧的**区域名**（用户 2026-10-13 定：用客户端自己的产品名）。
@@ -144,14 +170,20 @@ impl TraeRegion {
     /// 它们是改造前的「产品线」标识，而那两个产品线**都是国内构建**。
     /// 老前端/老链接带着这两个值进来时必须落到国内版，**不能**落到国际版 ——
     /// 否则会在国际版里读一个空账号库，用户看到的是「账号凭空消失」。
+    ///
+    /// ⚠️ 本函数**接受**程序位标识，不代表「这个 token 只说区域」 ——
+    /// 那个判据是 [`TraeRegion::is_region_token`]，两者不可互换。
     pub fn parse(s: &str) -> Option<TraeRegion> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "cn" | "china" | "domestic" | "trae_work" | "trae_cn" | "traework" | "trae" => {
-                Some(TraeRegion::Cn)
-            }
-            "global" | "intl" | "international" | "sg" | "ai" => Some(TraeRegion::Global),
-            _ => None,
+        let lowered = s.trim().to_ascii_lowercase();
+        if CN_TOKENS.contains(&lowered.as_str())
+            || LEGACY_CN_PROGRAM_TOKENS.contains(&lowered.as_str())
+        {
+            return Some(TraeRegion::Cn);
         }
+        if GLOBAL_TOKENS.contains(&lowered.as_str()) {
+            return Some(TraeRegion::Global);
+        }
+        None
     }
 
     /// 全部区域（遍历用，顺序稳定）。
@@ -385,6 +417,44 @@ mod tests {
         assert_eq!(TraeRegion::Global.display_name(), "Trae");
         // 默认必须落在与改造前同一份账号库上，否则老用户会看到账号凭空消失。
         assert_eq!(TraeRegion::default(), TraeRegion::Cn);
+    }
+
+    /// ★★ **纯区域标识**与历史**产品线（程序位）**标识必须分得开。
+    ///
+    /// 判据（`is_region_token`）服务的是一件事：程序位级入口收到 `"cn"` 时，
+    /// 我们应当去**该区域实际装着的**程序位里挑一条；而收到 `"trae_work"` 时，
+    /// 那是**用户点名的程序位**，没装就该响亮失败 —— 把它也当成「只说了区域」，
+    /// 会静默换一条客户端，登录态就写进了另一个客户端。
+    ///
+    /// 反例（改坏会红）：把 `trae_work` / `trae_cn` / `trae` 并进区域词表。
+    #[test]
+    fn 纯区域标识与历史产品线标识分得开() {
+        for token in ["cn", "china", "domestic", "CN", " cn "] {
+            assert!(TraeRegion::is_region_token(token), "`{token}` 应是纯区域标识");
+            assert_eq!(TraeRegion::parse(token), Some(TraeRegion::Cn));
+        }
+        for token in ["global", "intl", "international", "sg", "ai", "GLOBAL"] {
+            assert!(TraeRegion::is_region_token(token), "`{token}` 应是纯区域标识");
+            assert_eq!(TraeRegion::parse(token), Some(TraeRegion::Global));
+        }
+        // 历史产品线（程序位）标识：`parse` 仍然接受（老链接/老前端必须继续能用），
+        // 但它们**带程序位信息** ⇒ 不是纯区域标识。
+        for token in ["trae_work", "trae_cn", "traework", "trae"] {
+            assert!(
+                !TraeRegion::is_region_token(token),
+                "`{token}` 带程序位信息，不能当成纯区域标识"
+            );
+            assert_eq!(
+                TraeRegion::parse(token),
+                Some(TraeRegion::Cn),
+                "老链接仍须兼容：`{token}` 必须读到国内版"
+            );
+        }
+        // 不认识的一律两个都不是（否则会静默落到某个区域）。
+        for token in ["", "doubao", "trae_merged", "wb-cn"] {
+            assert!(!TraeRegion::is_region_token(token), "`{token}` 不是区域标识");
+        }
+        assert_eq!(TraeRegion::parse("trae_merged"), None);
     }
 
     /// 历史取值 `trae_work` / `trae_cn` **必须都解析成国内版**：

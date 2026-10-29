@@ -231,6 +231,52 @@ pub fn detect_install_for(variant: super::variant::TraeVariant) -> InstallProbe 
     }
 }
 
+/// 区域内程序位的**偏好序**：合并版在前、遗留 TraeCode 次之、遗留 TraeWork 最后。
+///
+/// ## 为什么合并版必须排第一
+///
+/// 客户端 2026-10-13 把 TraeWork 并入合并版（`TRAE SOLO CN` 被卸载、数据并入
+/// `Trae CN`，见 [`super::region::TraeProgram::Trae`] 的实测证据）。而在**已合并**的
+/// 机器上，合并版与遗留 TraeCode 的候选名**逐字相同**（`Trae CN` / `Trae CN.exe`）
+/// ⇒ 两条程序位的 [`detect_install_for`] **都会报已安装**，可真正的客户端只有一个。
+/// 此时若按程序表原序（TraeWork → TraeCode → 合并版）取首个装着的，就会落在
+/// **遗留 TraeCode** 上，界面上「探测到的是哪条产品线」于是说 TraeCode 而不是 Trae
+/// —— 用户已经因为这类错位报过一次障（同 [`super::variant::all_specs`] 的顺序理由）。
+///
+/// 抽成独立函数是为了**可测**：候选顺序是纯数据，一条断言就能钉住它
+/// （见 `区域内程序位偏好序把合并版排第一`）。
+pub fn region_program_preference(region: super::region::TraeRegion) -> [super::variant::TraeVariant; 1] {
+    let mut programs = super::region::TraeProgram::all();
+    programs.reverse();
+    programs.map(|program| variant_for_program(region, program))
+}
+
+/// 该区域**实际装着**的程序位。
+///
+/// ## 用途：把「只说了区域、没说程序位」的入参落到一条真实存在的客户端上
+///
+/// 程序位级入口（OAuth 登录 / 启动客户端）需要一条**程序位**，而调用方常常只报得出
+/// **区域**（前端唯一持有的轴是作用域 URL `/s/trae-cn/…`）。这时必须由我们把区域
+/// 落地成一条装着的程序位，否则 `"cn"` 会按宽容别名恒等于 `TraeWork` ——
+/// 而它在已合并的机器上并不存在（见
+/// [`super::handlers::variant_for_program_entry`] 的缺陷说明）。
+///
+/// ## 不编造事实
+///
+/// 判据优先使用 [`detect_install_for`]（exe 存在）；若自定义 exe 路径尚未探测到，
+/// 则次选已有活跃数据目录（[`select_data_dir_for`]，storage.json 存在）的程序位；
+/// 一个都没装且无数据目录时返回该区域的首选程序位（合并版 Trae，不再回落已被废弃并合并的旧版 TraeWork）。
+pub fn installed_variant_in_region(region: super::region::TraeRegion) -> super::variant::TraeVariant {
+    let preference = region_program_preference(region);
+    if let Some(&variant) = preference.iter().find(|v| detect_install_for(**v).installed) {
+        return variant;
+    }
+    if let Some(&variant) = preference.iter().find(|v| select_data_dir_for(**v).is_some()) {
+        return variant;
+    }
+    preference[0]
+}
+
 /// 「该变体没有数据目录」时的**用户可读原因**。
 ///
 /// ## 为什么必须有它（2026-09-24 用户报障原话）
@@ -265,7 +311,7 @@ pub fn data_dir_missing_reason(variant: super::variant::TraeVariant) -> String {
             exe.display()
         ),
         None => format!(
-            "未检测到【{line}】客户端：请先安装该客户端，\
+            "未检测到【{line}】客户端（缺少设备凭证）：请先安装该客户端，\
              或在「设置」里指定它的可执行文件路径，再重试。"
         ),
     }
@@ -569,26 +615,41 @@ fn windows_install_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// 非系统盘上的 `<盘符>:\Programs`。
+/// 非系统盘上的常见安装目录（`<盘符>:\Programs`、`<盘符>:\Develop`、`<盘符>:\Apps` 等）。
 ///
 /// 上面那几个环境变量**只覆盖系统盘**，而 Trae 安装器允许自选目录，装到
-/// `D:\Programs\...` 是很常见的选择（实测本机就是 `D:\Programs\TRAE SOLO CN\`）。
-/// 此时自动探测会一无所获、界面显示「未安装」，而用户几乎不可能想到
-/// 「原因是它装在 D 盘」。
+/// `D:\Programs\...` 或开发者常用的 `D:\Develop\...` 很常见（实测本机国内版在
+/// `D:\Programs\TRAE SOLO CN\`，国际版在 `D:\Develop\Trae\`）。
+/// 此时自动探测若只看系统盘与 Programs 会一无所获、界面显示「未安装」，而用户很难想到
+/// 原因只是自选了非默认盘符或常用目录。
 ///
-/// 先对 `<盘符>:\Programs` 做一次 `is_dir()` 再展开：不存在的路径判定很快，
+/// 先对常见目录做一次 `is_dir()` 再展开：不存在的路径判定很快，
 /// 而展开后每个候选都要 `is_file()`，先过滤能把探测次数从
-/// 「盘符数 × 名字数 × exe 数」压到只剩真实存在的那些。`C:` 不重复探测
+/// 「盘符数 × 目录数 × 名字数 × exe 数」压到只剩真实存在的那些。`C:` 不重复探测
 /// （`%LOCALAPPDATA%\Programs` 与 `ProgramFiles` 已覆盖）。
 ///
 /// 已知代价：盘符里若挂着**已断开的网络驱动器**，`is_dir()` 可能要等超时。
 /// 这里接受该代价 —— 探测只发生在「环境状态」查询上，不是热路径。
 #[cfg(windows)]
 fn secondary_drive_roots() -> Vec<PathBuf> {
-    (b'D'..=b'Z')
-        .map(|letter| PathBuf::from(format!("{}:\\Programs", letter as char)))
-        .filter(|dir| dir.is_dir())
-        .collect()
+    const CANDIDATE_FOLDERS: &[&str] = &[
+        "Programs",
+        "Develop",
+        "Development",
+        "Dev",
+        "Apps",
+        "Software",
+    ];
+    let mut roots = Vec::new();
+    for letter in b'D'..=b'Z' {
+        for folder in CANDIDATE_FOLDERS {
+            let dir = PathBuf::from(format!("{}:\\{}", letter as char, folder));
+            if dir.is_dir() {
+                roots.push(dir);
+            }
+        }
+    }
+    roots
 }
 
 /// 从「可执行文件所在目录」推导版本号。
@@ -3114,6 +3175,18 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn candidate_paths_includes_develop_folder_if_present() {
+        let candidates = candidate_paths_for(&["Trae"], &["Trae.exe"]);
+        if std::path::Path::new("D:\\Develop").is_dir() {
+            assert!(
+                candidates.contains(&std::path::PathBuf::from("D:\\Develop\\Trae\\Trae.exe")),
+                "候选路径列表应包含 D:\\Develop\\Trae\\Trae.exe: {candidates:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn running_processes_lists_only_registered_names() {
         // 只读探测，且不得返回候选表以外的名字（否则 taskkill 会打错目标）。
         let running = running_processes();
@@ -3167,5 +3240,76 @@ mod tests {
         assert_eq!(probe.exe.as_deref(), Some(exe.as_path()));
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// ★★ 区域内程序位的偏好序必须把**合并版**排第一。
+    ///
+    /// 现场：客户端 2026-10-13 把 TraeWork 并入合并版，`TRAE SOLO CN` 被卸载。
+    /// 在**已合并**的机器上，合并版与遗留 TraeCode 的候选名**逐字相同**
+    /// （`Trae CN` / `Trae CN.exe`）⇒ 两条程序位的探测**都会说已安装**，
+    /// 可真正的客户端只有一个。此时若按程序表原序取首个装着的，就会落在遗留
+    /// TraeCode 上，界面上「探测到的是哪条产品线」于是把合并版说成 TraeCode
+    /// —— 用户已因这类错位报过一次障（同 [`super::variant::all_specs`] 的顺序理由）。
+    ///
+    /// 反例（改坏会红）：删掉 `region_program_preference` 里的 `reverse()`。
+    #[test]
+    fn 区域内程序位偏好序把合并版排第一() {
+        use super::super::region::TraeRegion;
+        use super::super::variant::TraeVariant;
+
+        let cn = region_program_preference(TraeRegion::Cn);
+        assert_eq!(
+            cn,
+            [
+                TraeVariant::TraeMerged,
+            ],
+            "CN 偏好序必须是合并版"
+        );
+        let global = region_program_preference(TraeRegion::Global);
+        assert_eq!(
+            global,
+            [
+                TraeVariant::GlobalTraeMerged,
+            ],
+            "国际区域同形：合并版在前"
+        );
+
+        // ★ 偏好序**绝不跨区域**：跨了就会把国际版的登录落到国内客户端上。
+        for variant in cn {
+            assert_eq!(variant.region(), TraeRegion::Cn);
+        }
+        for variant in global {
+            assert_eq!(variant.region(), TraeRegion::Global);
+        }
+    }
+
+    /// ★ `installed_variant_in_region` 只回答「这个区域装着哪条」，**不编造事实**。
+    ///
+    /// 两条断言都与「本机装了什么」无关，因此三平台 CI 上同样成立：
+    /// - 结果必属该区域（跨区域 = 把登录态写进另一个账号体系的客户端）；
+    /// - 结果要么**真的装着**，要么是该区域的主程序位兜底（一个都没装时的报错口径）。
+    #[test]
+    fn installed_variant_in_region_stays_in_region_and_never_fakes_installed() {
+        use super::super::region::TraeRegion;
+
+        // `detect_install_for` 内部会读 settings（落 `BUDDY_SWITCH_HOME`），
+        // 与其它读环境的用例一样持 `env_lock()`，免得被并发改走 home 造成假失败。
+        let _lock = crate::modules::config::env_lock();
+
+        for region in TraeRegion::all() {
+            let resolved = installed_variant_in_region(region);
+            assert_eq!(
+                resolved.region(),
+                region,
+                "区域解析结果跨了区域：{region:?} → {resolved:?}"
+            );
+            let fallback_program = region_program_preference(region)[0];
+            assert!(
+                detect_install_for(resolved).installed
+                    || select_data_dir_for(resolved).is_some()
+                    || resolved == fallback_program,
+                "{region:?} 解析出 {resolved:?}，但它既没装、也没有数据目录、也不是该区域的首选程序位兜底"
+            );
+        }
     }
 }

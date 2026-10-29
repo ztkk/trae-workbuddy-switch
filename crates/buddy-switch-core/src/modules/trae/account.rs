@@ -1415,7 +1415,22 @@ fn resolve_refresh_secret(
     device_id: Option<&str>,
 ) -> Result<icube::DeviceSecret, icube::IcubeError> {
     match device_id.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(device_id) => icube::device_secret_by_device_id(variant, device_id),
+        Some(device_id) => {
+            let primary = icube::device_secret_by_device_id(variant, device_id);
+            if primary.is_ok() {
+                return primary;
+            }
+            // 同区域 fallback 机制：若在当前变体下找不到（如客户端升级合并后仅存 Trae CN 目录），
+            // 尝试在同区域偏好序的其他变体中按 device_id 查找。
+            for candidate in crate::modules::trae::platform::region_program_preference(variant.region()) {
+                if candidate != variant {
+                    if let Ok(sec) = icube::device_secret_by_device_id(candidate, device_id) {
+                        return Ok(sec);
+                    }
+                }
+            }
+            primary
+        }
         None => {
             // 留痕：不阻塞流程，但必须留下「这次没有绑定、是猜的」这个事实。
             store::append_log(
@@ -1426,7 +1441,19 @@ fn resolve_refresh_secret(
                     variant.display_name()
                 ),
             );
-            icube::device_secret_for(variant)
+            let primary = icube::device_secret_for(variant);
+            if primary.is_ok() {
+                return primary;
+            }
+            // 同区域 fallback 机制：当前变体目录缺失或未找到凭据时，尝试同区域偏好序的其他变体。
+            for candidate in crate::modules::trae::platform::region_program_preference(variant.region()) {
+                if candidate != variant {
+                    if let Ok(sec) = icube::device_secret_for(candidate) {
+                        return Ok(sec);
+                    }
+                }
+            }
+            primary
         }
     }
 }

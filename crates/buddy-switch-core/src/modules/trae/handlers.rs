@@ -442,6 +442,51 @@ pub fn parse_variant_id(raw: Option<&str>) -> TraeVariant {
     }
 }
 
+/// 解析**程序位级入口**的 `variant` 参数（OAuth 登录 / 启动客户端专用）。
+///
+/// ## 为什么不能沿用 [`parse_variant_param`]（本函数修掉的缺陷）
+///
+/// 这两个入口收的 `variant` 是**程序位**级参数：它决定读哪个客户端的数据目录去取
+/// icube 设备凭证、以及启动哪个 exe。而调用方唯一持有的轴常常是**区域**
+/// —— 前端把作用域写进 URL（`/s/trae-cn/…`）后，它传下来的就是 `"cn"`；
+/// 而 [`parse_variant_param`] 的宽容别名把 `"cn"` 读成 `TraeWork`
+/// （见 [`TraeVariant::parse`] 的说明），等于**替用户点名了一条他没选过的程序位**。
+///
+/// 而 2026-10-13 客户端把 TraeWork **并入**合并版之后，`TraeWork` 在**已合并的机器上
+/// 并不存在**，于是：
+///
+/// - 现象：点「开始 Trae CN 网页登录」，报「未检测到【TraeWork CN】客户端」
+///   —— 按钮写 `Trae CN`（那是**区域名**）、报错写 `TraeWork CN`（那是**程序位名**），
+///   这个错位正是「区域被当成程序位」的指纹；
+/// - 按提示去「设置里指定可执行文件路径」也救不了：设置里的客户端路径**按区域**存
+///   （[`super::settings::TraeSettings::trae_paths`]），而 [`detect_install_for`] 的采纳
+///   条件是**变体级**的 —— 指向 `Trae CN.exe` 时只有合并版槽位认它。
+///
+/// ## 判据：只看入参**有没有携带程序位信息**
+///
+/// | 入参 | 处理 | 理由 |
+/// |:--|:--|:--|
+/// | 纯区域标识（`cn` / `global` / …） | 挑该区域**实际装着**的程序位 | 区域标识不带程序位信息，只能由我们落地到一条真实客户端；见 [`installed_variant_in_region`] |
+/// | 程序位标识（`trae_work` / `trae_cn` / `trae` / `trae_merged` / …） | **原样尊重**，不替换 | 那是点名要操作哪条程序位；没装就应当**响亮失败**，静默换一条会把登录态写进另一个客户端 |
+/// | 缺失 / 无法识别 | 默认变体（与 [`parse_variant_param`] 同向） | 老调用点行为不变 |
+///
+/// ★ 结果**绝不跨区域**：区域标识只在该区域内部挑程序位，所以国际版的登录不会被
+/// 落到国内客户端上（有单测钉住）。
+///
+/// [`detect_install_for`]: super::platform::detect_install_for
+/// [`installed_variant_in_region`]: super::platform::installed_variant_in_region
+/// [`super::settings::TraeSettings::trae_paths`]: super::settings::TraeSettings
+pub fn variant_for_program_entry(raw: Option<&str>) -> TraeVariant {
+    if let Some(raw) = raw {
+        if super::region::TraeRegion::is_region_token(raw) {
+            if let Some(region) = super::region::TraeRegion::parse(raw) {
+                return super::platform::installed_variant_in_region(region);
+            }
+        }
+    }
+    raw.and_then(TraeVariant::parse).unwrap_or_default()
+}
+
 /// 签到网络失败重试次数的上限。
 ///
 /// 无论来自请求参数还是设置，都必须夹到这个值：前端传 `1e9` 会造成事实上的死循环。
@@ -1617,5 +1662,65 @@ mod tests {
         assert_eq!(value["supportedOn"], "Windows");
         assert!(value.get("reason").is_some());
         assert!(value.get("ok").is_none(), "非 Windows 不得返回假成功");
+    }
+
+    /// ★★ 程序位级入口的入参解析：**区域标识不得被当成程序位**。
+    ///
+    /// 现场（用户报障）：点「开始 Trae CN 网页登录」，按钮写的是 `Trae CN`
+    /// （那是**区域名**），报错却说「未检测到【TraeWork CN】客户端」（那是**程序位名**）。
+    /// 根因是前端唯一持有的轴是**区域**（作用域写进 URL `/s/trae-cn/…` ⇒ 它传 `"cn"`），
+    /// 而宽容别名把 `"cn"` 读成了 `TraeWork`；客户端 2026-10-13 合并后本机只剩
+    /// `Trae CN`、`TraeWork` 已被卸载 ⇒ 必然报「未检测到」。
+    ///
+    /// 反例（改坏会红）：把本函数改回 `parse_variant_param` 的口径
+    /// （`raw.and_then(TraeVariant::parse)`）⇒ 区域那一组断言在已合并的机器上红。
+    #[test]
+    fn 区域标识入口不再落到不存在的程序位() {
+        // 解析要走 `detect_install_for`（内部读 settings ⇒ 落 `BUDDY_SWITCH_HOME`），
+        // 与其它读环境的用例一样持 `env_lock()`，免得被并发改走 home 造成假失败。
+        let _lock = crate::modules::config::env_lock();
+
+        // ★ 显式程序位标识：**原样尊重**，不因为「没装」就换一条。
+        // 静默替换会把登录态写进另一个客户端 —— 本仓最怕的那类事故。
+        for token in [
+            "trae_work",
+            "trae_cn",
+            "trae",
+            "trae_merged",
+            "global_trae_code",
+            "global_trae_merged",
+        ] {
+            assert_eq!(
+                variant_for_program_entry(Some(token)),
+                TraeVariant::parse(token).expect("测试前提：这些 token 都是合法程序位标识"),
+                "`{token}` 是点名的程序位，不得被替换成另一条"
+            );
+        }
+
+        // ★ 纯区域标识：结果**必属该区域**（国际版的登录绝不能被落到国内客户端上）。
+        // 刻意不断言具体是哪条程序位 —— 那取决于本机装了什么，断言会变成机器相关。
+        for token in ["cn", "china", "domestic", "CN"] {
+            assert_eq!(
+                variant_for_program_entry(Some(token)).region(),
+                TraeRegion::Cn,
+                "`{token}` 应解析到国内区域的程序位"
+            );
+        }
+        for token in ["global", "intl", "international", "sg", "ai"] {
+            assert_eq!(
+                variant_for_program_entry(Some(token)).region(),
+                TraeRegion::Global,
+                "`{token}` 应解析到国际区域的程序位"
+            );
+        }
+
+        // 缺失 / 无法识别：仍回落默认变体（老调用点行为不变）。
+        // 本次刻意**不**把这两个也改成「按区域挑」—— 那会让老客户端的语义一起变。
+        assert_eq!(variant_for_program_entry(None), TraeVariant::default());
+        assert_eq!(variant_for_program_entry(Some("")), TraeVariant::default());
+        assert_eq!(
+            variant_for_program_entry(Some("doubao")),
+            TraeVariant::default()
+        );
     }
 }

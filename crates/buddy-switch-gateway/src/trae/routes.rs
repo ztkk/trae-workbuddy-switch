@@ -46,7 +46,8 @@ use super::payload;
 use super::pool::{classify_http, classify_solo, PickedTraeAccount, TraeErrKind, TraePool};
 use super::sse::{self, TokenUsage};
 use super::{
-    now_secs, TraeGatewayState, TRAE_APP_ID, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE,
+    now_secs, TraeGatewayState, TRAE_APP_ID, TRAE_IDE_VERSION,
+    TRAE_IDE_VERSION_CODE, TRAE_IDE_VERSION_CODE_GLOBAL, TRAE_IDE_VERSION_GLOBAL,
     TRAE_LLM_CHAT_PATH,
 };
 
@@ -1512,7 +1513,66 @@ pub(crate) async fn chat_once_for_account(
     if let Some(capture) = capture {
         capture.request_pair(body, &converted);
     }
-    send_llm_chat(state, account, &converted, capture).await
+    send_llm_chat(state, variant, account, &converted, capture).await
+}
+
+/// 宿主机动态设备指纹信息（单例缓存，与真实宿主机环境对齐，消除任何硬编码假特征）。
+#[derive(Debug, Clone)]
+struct HostFingerprint {
+    device_type: &'static str,
+    device_cpu: &'static str,
+    device_brand: Option<String>,
+    os_version: &'static str,
+}
+
+fn host_fingerprint() -> &'static HostFingerprint {
+    static CACHE: std::sync::OnceLock<HostFingerprint> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let device_type = match std::env::consts::OS {
+            "windows" => "windows",
+            "macos" => "darwin",
+            "linux" => "linux",
+            other => other,
+        };
+
+        let device_cpu = if cfg!(target_arch = "aarch64") {
+            if cfg!(target_os = "macos") {
+                "Apple"
+            } else {
+                "ARM"
+            }
+        } else {
+            let proc_id = std::env::var("PROCESSOR_IDENTIFIER")
+                .unwrap_or_default()
+                .to_uppercase();
+            if proc_id.contains("AMD") {
+                "AMD"
+            } else {
+                "Intel"
+            }
+        };
+
+        let os_version = match std::env::consts::OS {
+            "windows" => "Windows 11",
+            "macos" => "macOS",
+            "linux" => "Linux",
+            _ => "Unknown",
+        };
+
+        // 允许通过环境变量指定设备型号；若未显式指定，默认留空不发送 x-device-brand
+        // （逐字对齐客户端源码 d.device_model && header 的安全策略，彻底杜绝 CREFG-XX 等假指纹特征碰撞）。
+        let device_brand = std::env::var("BUDDY_SWITCH_DEVICE_BRAND")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        HostFingerprint {
+            device_type,
+            device_cpu,
+            device_brand,
+            os_version,
+        }
+    })
 }
 
 /// 发一次 `llm_utils_chat`：拿到响应头即返回，不读 body。
@@ -1526,14 +1586,33 @@ pub(crate) async fn chat_once_for_account(
 /// 排查时真正要看的是完整原文。
 async fn send_llm_chat(
     state: &TraeGatewayState,
+    variant: TraeVariant,
     account: &PickedTraeAccount,
     body: &[u8],
     capture: Option<&Capture>,
 ) -> Result<reqwest::Response, (u16, String)> {
-    let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream);
+    let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream_for(variant));
     let trace_id = trace_id();
+    let fp = host_fingerprint();
 
-    let response = state
+    let is_global = variant.region() == TraeRegion::Global;
+    let ide_version = if is_global {
+        TRAE_IDE_VERSION_GLOBAL
+    } else {
+        TRAE_IDE_VERSION
+    };
+    let ide_version_code = if is_global {
+        TRAE_IDE_VERSION_CODE_GLOBAL
+    } else {
+        TRAE_IDE_VERSION_CODE
+    };
+    let package_type = if is_global {
+        "stable_i18n"
+    } else {
+        "stable_cn"
+    };
+
+    let mut req = state
         .http
         .post(&url)
         .header(header::CONTENT_TYPE, "application/json")
@@ -1542,25 +1621,25 @@ async fn send_llm_chat(
         .header(header::USER_AGENT, TRAE_USER_AGENT)
         .header(header::REFERER, &url)
         .header("x-ide-token", &account.jwt)
+        .header(header::AUTHORIZATION, format!("Bearer {}", &account.jwt))
         .header("x-app-id", TRAE_APP_ID)
         .header("x-app-version", "default")
-        .header("x-app-version-code", TRAE_IDE_VERSION_CODE)
-        .header("x-ide-version", TRAE_IDE_VERSION)
-        .header("x-ide-version-code", TRAE_IDE_VERSION_CODE)
+        .header("x-app-version-code", ide_version_code)
+        .header("x-ide-version", ide_version)
+        .header("x-ide-version-code", ide_version_code)
         .header("x-ide-version-type", "stable")
-        .header("x-device-type", "windows")
-        .header("x-device-brand", "CREFG-XX")
-        .header("x-device-cpu", "Intel")
+        .header("x-device-type", fp.device_type)
+        .header("x-device-cpu", fp.device_cpu)
         .header("x-device-id", &account.device_id)
         .header("x-machine-id", &account.machine_id)
-        .header("x-os-version", "Windows 11 Home China")
+        .header("x-os-version", fp.os_version)
         .header("request-traffic-type", "prod")
-        .header("package-type", "stable_cn")
+        .header("package-type", package_type)
         .header("x-lgw-req-sdk-type", "3")
         .header("x-lscbd-aid", "787976")
-        .header("x-lscbd-platform", "windows")
+        .header("x-lscbd-platform", fp.device_type)
         .header("x-ss-dp", "787976")
-        .header("app-version", TRAE_IDE_VERSION)
+        .header("app-version", ide_version)
         .header("x-custom-trace-id", &trace_id[..16])
         .header(
             "x-flow-traceparent",
@@ -1568,7 +1647,13 @@ async fn send_llm_chat(
         )
         .header("x-tt-trace-id", &trace_id)
         .header("x-request-id", format!("req_{}", uuid_like()))
-        .body(body.to_vec())
+        .body(body.to_vec());
+
+    if let Some(ref brand) = fp.device_brand {
+        req = req.header("x-device-brand", brand);
+    }
+
+    let response = req
         .send()
         .await
         .map_err(|error| (0u16, describe_transport_error(&error)))?;
@@ -2371,7 +2456,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, &picked, &encoded, None).await {
+            match send_llm_chat(&state, TraeVariant::TraeWork, &picked, &encoded, None).await {
                 Ok(mut response) => {
                     // 累积若干块，直到看见 `event:metadata`（上游认了）或 `event:error`（上游拒了）。
                     // ⚠️ 只看**首块**会把 `event:progress_notice`（排队中）误判成结论 —— 踩过。
@@ -2478,7 +2563,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, &picked, &encoded, None).await {
+            match send_llm_chat(&state, TraeVariant::TraeWork, &picked, &encoded, None).await {
                 Ok(mut response) => {
                     let mut buffer = String::new();
                     let mut verdict = "超时".to_string();

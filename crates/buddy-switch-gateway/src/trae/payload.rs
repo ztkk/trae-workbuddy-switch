@@ -20,10 +20,12 @@ use std::collections::BTreeSet;
 
 use buddy_switch_core::modules::product::scope_of_trae_region;
 use buddy_switch_core::modules::trae::model_list::ClientModelList;
+use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
 
 use super::{
     function_for, TRAE_APP_ID, TRAE_DEFAULT_MODEL, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE,
+    TRAE_IDE_VERSION_CODE_GLOBAL, TRAE_IDE_VERSION_GLOBAL,
 };
 
 /// 模型名映射：`模型名 → (config_name, model_name)`。
@@ -601,10 +603,27 @@ pub fn prepare_llm_chat_body(
     // —— 该字段**不钳制**实际上下文，1M 窗口由上游内部决策。
     object.insert("prompt_max_tokens".into(), json!(168_000));
     object.insert("mode".into(), json!("FunctionCall"));
-    object.insert("ide_version".into(), json!(TRAE_IDE_VERSION));
-    object.insert("ide_version_code".into(), json!(TRAE_IDE_VERSION_CODE));
+    let is_global = variant.region() == TraeRegion::Global;
+    let ide_version = if is_global {
+        TRAE_IDE_VERSION_GLOBAL
+    } else {
+        TRAE_IDE_VERSION
+    };
+    let ide_version_code = if is_global {
+        TRAE_IDE_VERSION_CODE_GLOBAL
+    } else {
+        TRAE_IDE_VERSION_CODE
+    };
+    let package_type = if is_global {
+        "stable_i18n"
+    } else {
+        "stable_cn"
+    };
+
+    object.insert("ide_version".into(), json!(ide_version));
+    object.insert("ide_version_code".into(), json!(ide_version_code));
     object.insert("app_id".into(), json!(TRAE_APP_ID));
-    object.insert("package_type".into(), json!("stable_cn"));
+    object.insert("package_type".into(), json!(package_type));
     if max_mode {
         object.insert("is_max_mode".into(), json!(true));
     }
@@ -1470,6 +1489,42 @@ mod tests {
         // 客户端清单里没有 `config_name` 字段 ⇒ 只能派生，派生结果必须原样是模型名。
         assert_eq!(out["config_name"], "glm-5.3-flash");
         assert_eq!(out["model_name"], "glm-5.3-flash__dev");
+    }
+
+    /// ★ 护栏：CN 与 Global 请求体的 package_type / ide_version / ide_version_code 自适应。
+    #[test]
+    fn payload_adapts_to_region_spec() {
+        let bytes = serde_json::to_vec(&json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "user", "content": "ping"}],
+        }))
+        .unwrap();
+
+        let cn_out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            &bytes,
+            TraeVariant::TraeMerged,
+            "deepseek-v4.1-flash",
+            "u1",
+            "dev1",
+            "mach1",
+        ))
+        .unwrap();
+        assert_eq!(cn_out["package_type"], "stable_cn");
+        assert_eq!(cn_out["ide_version"], TRAE_IDE_VERSION);
+        assert_eq!(cn_out["ide_version_code"], TRAE_IDE_VERSION_CODE);
+
+        let global_out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            &bytes,
+            TraeVariant::GlobalTraeMerged,
+            "deepseek-v4.1-flash",
+            "u1",
+            "dev1",
+            "mach1",
+        ))
+        .unwrap();
+        assert_eq!(global_out["package_type"], "stable_i18n");
+        assert_eq!(global_out["ide_version"], TRAE_IDE_VERSION_GLOBAL);
+        assert_eq!(global_out["ide_version_code"], TRAE_IDE_VERSION_CODE_GLOBAL);
     }
 
     /// ★★ 护栏：`/v1/models` **只列本 function 分组里的模型**。

@@ -70,11 +70,11 @@ use pool::TraePool;
 /// **不是同一个主机**：对话走 mchost.guru 的 agent 网关。两者不可互换。
 ///
 /// 取值与 [`buddy_switch_core::modules::trae::variant`] 的 CN 端点表逐字一致
-/// （实测两条 CN 产品线都是这个主机）；该表另登记了国际化的
-/// `https://core-normal.trae.ai`，**但从未对真实上游跑通过**。
-/// 想按变体/地区切换出站时，请改 [`TraeGatewayConfig::upstream`] 的取值来源，
-/// 不要在调用点写分支 —— 该字段本来就是为"可重定向出站"设计的（e2e 测试也靠它）。
+/// （实测两条 CN 产品线都是这个主机）。
 pub const TRAE_AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
+
+/// Trae 国际版上游基址（实测通过）。
+pub const TRAE_AGENT_HOST_GLOBAL: &str = "https://core-normal.trae.ai";
 
 /// SOLO 对话接口路径（消耗 IDE 积分，product_id 208）。
 pub const TRAE_LLM_CHAT_PATH: &str = "/api/agent/v3/llm_utils_chat";
@@ -82,9 +82,13 @@ pub const TRAE_LLM_CHAT_PATH: &str = "/api/agent/v3/llm_utils_chat";
 /// 客户端 App ID（参考实现硬编码值，非机密）。
 pub const TRAE_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 
-/// IDE 版本号与版本码，随上游校验字段一同下发。
-pub const TRAE_IDE_VERSION: &str = "0.1.50";
-pub const TRAE_IDE_VERSION_CODE: &str = "20260811";
+/// IDE 版本号与版本码，随上游校验字段一同下发（对齐最新 Trae CN 3.4.11 / 2.3.98528）。
+pub const TRAE_IDE_VERSION: &str = "3.4.11";
+pub const TRAE_IDE_VERSION_CODE: &str = "2.3.98528";
+
+/// Trae 国际版 IDE 版本号与版本码（实测对齐国际版服务端版本门禁 3.7.0 / 20260501）。
+pub const TRAE_IDE_VERSION_GLOBAL: &str = "3.7.0";
+pub const TRAE_IDE_VERSION_CODE_GLOBAL: &str = "20260501";
 
 /// `function` 字段取值 —— **按程序位分家**（2026-09-30 实测，issue #4「看得见、调不动」）。
 ///
@@ -426,6 +430,18 @@ impl TraeGatewayState {
         }
     }
 
+    /// 根据变体所属区域解析出站上游基址。
+    /// 若 `self.upstream` 被集成测试覆写（非默认的 `TRAE_AGENT_HOST`），优先保持其覆写值。
+    pub fn upstream_for(&self, variant: TraeVariant) -> &str {
+        if self.upstream != TRAE_AGENT_HOST {
+            return &self.upstream;
+        }
+        match variant.region() {
+            TraeRegion::Cn => TRAE_AGENT_HOST,
+            TraeRegion::Global => TRAE_AGENT_HOST_GLOBAL,
+        }
+    }
+
     /// 读取配置快照。
     pub async fn config_snapshot(&self) -> TraeGatewayConfig {
         self.config.read().await.clone()
@@ -712,7 +728,7 @@ pub async fn status_view(
     };
     body.insert("accounts".into(), serde_json::json!(accounts));
     body.insert("diagnose".into(), serde_json::json!(diagnose));
-    body.insert("upstream".into(), serde_json::json!(state.upstream));
+    body.insert("upstream".into(), serde_json::json!(state.upstream_for(variant)));
     serde_json::Value::Object(body)
 }
 
@@ -1047,5 +1063,20 @@ mod tests {
         // 不得出现 camelCase 键。
         assert!(!value.as_object().unwrap().contains_key("baseUrl"));
         assert!(!value.as_object().unwrap().contains_key("apiKey"));
+    }
+
+    #[test]
+    fn upstream_for_distinguishes_cn_and_global() {
+        let state = TraeGatewayState::new(TraeGatewayConfig::default());
+        assert_eq!(state.upstream_for(TraeVariant::TraeWork), TRAE_AGENT_HOST);
+        assert_eq!(state.upstream_for(TraeVariant::TraeMerged), TRAE_AGENT_HOST);
+        assert_eq!(state.upstream_for(TraeVariant::Global), TRAE_AGENT_HOST_GLOBAL);
+        assert_eq!(state.upstream_for(TraeVariant::GlobalTraeMerged), TRAE_AGENT_HOST_GLOBAL);
+
+        // 当测试覆写 upstream 时，所有变体均走覆写地址
+        let mut custom_state = state.clone();
+        custom_state.upstream = "http://127.0.0.1:9999".to_string();
+        assert_eq!(custom_state.upstream_for(TraeVariant::TraeWork), "http://127.0.0.1:9999");
+        assert_eq!(custom_state.upstream_for(TraeVariant::GlobalTraeMerged), "http://127.0.0.1:9999");
     }
 }
