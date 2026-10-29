@@ -45,7 +45,8 @@ use super::pool::{classify_http, classify_solo, PickedTraeAccount, TraeErrKind, 
 use super::sse::{self, TokenUsage};
 use super::{
     now_secs, TraeGatewayState, TRAE_APP_ID, TRAE_IDE_VERSION,
-    TRAE_IDE_VERSION_CODE, TRAE_LLM_CHAT_PATH,
+    TRAE_IDE_VERSION_CODE, TRAE_IDE_VERSION_CODE_GLOBAL, TRAE_IDE_VERSION_GLOBAL,
+    TRAE_LLM_CHAT_PATH,
 };
 
 /// 请求扩展：承载 Bearer Key 的**归属标识**，供 handler 选择对应的账号池与 `function`。
@@ -763,7 +764,7 @@ async fn attempt_once(
         &picked.machine_id,
     );
 
-    match send_llm_chat(state, &picked, &converted).await {
+    match send_llm_chat(state, variant, &picked, &converted).await {
         Ok(response) => {
             // 会话粘性：**只在成功之后**绑定，让下一轮优先复用这个账号。
             state.bind_sticky(sticky_key, &picked.uid).await;
@@ -874,12 +875,30 @@ fn host_fingerprint() -> &'static HostFingerprint {
 /// 本 crate 的 reqwest 未开 gzip/br/zstd 特性，若上游压缩返回，读出来就是乱码。
 async fn send_llm_chat(
     state: &TraeGatewayState,
+    variant: TraeVariant,
     account: &PickedTraeAccount,
     body: &[u8],
 ) -> Result<reqwest::Response, (u16, String)> {
-    let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream);
+    let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream_for(variant));
     let trace_id = trace_id();
     let fp = host_fingerprint();
+
+    let is_global = variant.region() == TraeRegion::Global;
+    let ide_version = if is_global {
+        TRAE_IDE_VERSION_GLOBAL
+    } else {
+        TRAE_IDE_VERSION
+    };
+    let ide_version_code = if is_global {
+        TRAE_IDE_VERSION_CODE_GLOBAL
+    } else {
+        TRAE_IDE_VERSION_CODE
+    };
+    let package_type = if is_global {
+        "stable_i18n"
+    } else {
+        "stable_cn"
+    };
 
     let mut req = state
         .http
@@ -893,9 +912,9 @@ async fn send_llm_chat(
         .header(header::AUTHORIZATION, format!("Bearer {}", &account.jwt))
         .header("x-app-id", TRAE_APP_ID)
         .header("x-app-version", "default")
-        .header("x-app-version-code", TRAE_IDE_VERSION_CODE)
-        .header("x-ide-version", TRAE_IDE_VERSION)
-        .header("x-ide-version-code", TRAE_IDE_VERSION_CODE)
+        .header("x-app-version-code", ide_version_code)
+        .header("x-ide-version", ide_version)
+        .header("x-ide-version-code", ide_version_code)
         .header("x-ide-version-type", "stable")
         .header("x-device-type", fp.device_type)
         .header("x-device-cpu", fp.device_cpu)
@@ -903,12 +922,12 @@ async fn send_llm_chat(
         .header("x-machine-id", &account.machine_id)
         .header("x-os-version", fp.os_version)
         .header("request-traffic-type", "prod")
-        .header("package-type", "stable_cn")
+        .header("package-type", package_type)
         .header("x-lgw-req-sdk-type", "3")
         .header("x-lscbd-aid", "787976")
         .header("x-lscbd-platform", fp.device_type)
         .header("x-ss-dp", "787976")
-        .header("app-version", TRAE_IDE_VERSION)
+        .header("app-version", ide_version)
         .header("x-custom-trace-id", &trace_id[..16])
         .header(
             "x-flow-traceparent",
@@ -1548,7 +1567,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, &picked, &encoded).await {
+            match send_llm_chat(&state, TraeVariant::TraeWork, &picked, &encoded).await {
                 Ok(mut response) => {
                     // 累积若干块，直到看见 `event:metadata`（上游认了）或 `event:error`（上游拒了）。
                     // ⚠️ 只看**首块**会把 `event:progress_notice`（排队中）误判成结论 —— 踩过。
@@ -1653,7 +1672,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, &picked, &encoded).await {
+            match send_llm_chat(&state, TraeVariant::TraeWork, &picked, &encoded).await {
                 Ok(mut response) => {
                     let mut buffer = String::new();
                     let mut verdict = "超时".to_string();

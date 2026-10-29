@@ -102,6 +102,10 @@ pub fn classify_solo(code: i64, message: &str) -> TraeErrKind {
     if code == 4001 || lower.contains("model config is empty") {
         return TraeErrKind::None;
     }
+    // 4120 是客户端版本门禁（提示需升级最新版本），不是账号本身失效。
+    if code == 4120 || lower.contains("4120") {
+        return TraeErrKind::Client;
+    }
     if code == 4008
         || lower.contains("quota")
         || lower.contains("exceeded")
@@ -753,6 +757,8 @@ mod tests {
         // 4001 是模型配置问题，不该冷却账号。
         assert_eq!(classify_solo(4001, ""), TraeErrKind::None);
         assert_eq!(classify_solo(0, "model config is empty"), TraeErrKind::None);
+        // 4120 是版本门禁。
+        assert_eq!(classify_solo(4120, ""), TraeErrKind::Client);
         // 4008 是限流，短冷却。
         assert_eq!(classify_solo(4008, ""), TraeErrKind::SoftRate);
         assert_eq!(classify_solo(0, "Quota exceeded"), TraeErrKind::SoftRate);
