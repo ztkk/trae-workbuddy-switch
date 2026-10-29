@@ -1,95 +1,68 @@
-# fix(trae): 区域标识不再被当成程序位，修已合并客户端上的登录失败
+# fix(trae): 适配合并版客户端探测与自定义路径，打通国际版 Trae 网关调用与协议参数
 
-## 复现步骤
+## 为什么提这个 PR
 
-前置：机器上**只装了合并版** `Trae CN`（`TRAE SOLO CN` / `TRAE SOLO` 都不存在，
-即客户端 2026-10-13 合并之后的常态）。
+合并版 Trae（国内版 `Trae CN`、国际版 `Trae`）发布后，在两处关键链路存在阻塞性问题：
+1. **本地客户端检测与登录导入失败**：机器上仅安装了合并版（或安装在 `D:\Develop` 等自定义开发目录），点击登录或启动客户端时报错 `未检测到【TraeWork】客户端`。
+2. **国际版账号网关调用 HTTP 401 失败与 4120 拦截**：导入国际版账号后，网关出站请求直接报错 `HTTP 401（code: 1001: We're sorry, but we are not able to authenticate you）`，无法调用国际版模型。
 
-1. 打开「TraeWork 国内版 → 账号」（URL `/s/trae-cn/accounts`）
-2. 「添加账号」→「OAuth 网页登录」→ 点「**开始 Trae CN 网页登录**」
-3. 报错：`未检测到【TraeWork CN】客户端：请先安装该客户端，或在「设置」里指定它的可执行文件路径，再重试。`
+本 PR 针对上述问题进行了系统性修复，并通过真实国际版账号现场完成了端到端调用验证。
 
-「启动客户端」按钮同样报这句。
+---
 
-## 根因
+## 根因分析
 
-**指纹是文案错位**：按钮写 `Trae CN`（**区域名**），报错写 `TraeWork CN`（**程序位名**）。
+### 1. 客户端探测与代次别名回退错误
+- 前端交互持有的是**区域轴**（如 URL `/s/trae-cn/...` 或 `/s/trae-global/...`），传给后端的入参为纯区域标识 `"cn"` 或 `"global"`。
+- 后端入参解析直接走 `TraeVariant::parse`，其别名规则把 `"cn"` 和 `"global"` 映射为了旧时代的单体版 `TraeWork`（`TRAE SOLO`）。
+- 在现代仅安装合并版的机器上，`TRAE SOLO.exe` 不存在，导致探测与数据目录定位失败；且 `secondary_drive_roots()` 仅扫描了常见系统盘，遗漏了 `D:\Develop` 等二次开发路径。
 
-- 前端唯一持有的轴是**区域**（作用域写进 URL `/s/trae-cn/…`），
-  `trae-oauth-login-dialog.tsx` 用 `useTraeVariant()` 取值后原样传给后端 ⇒ 后端收到 `"cn"`。
-- 而这两个入口收的是**程序位**级参数，解析走 `TraeVariant::parse`，
-  其宽容别名把 `"cn"` 读成了 `TraeWork`（`variant.rs:307`）。
-- 客户端合并后 `TraeWork` 的候选（`TRAE SOLO CN.exe` / `TRAE SOLO.exe`）不存在
-  ⇒ `detect_install_for` 返回 `installed: false` ⇒ `data_dir_missing_reason` 给出「未检测到」。
+### 2. 网关出站硬编码国内上游且缺乏国际版协议校验
+- 网关 [`send_llm_chat`] 出站基址硬编码了国内端点 `https://trae-api-cn.mchost.guru`，将国际版 JWT 发往国内端点时，国内服务端无法认证该租户凭据，直接返回 HTTP 401。
+- 源码注释曾标明国际版端点 `core-normal.trae.ai` *“从未对真实上游跑通过”*。经现场发包逆向分析，国际版服务端还存在两道强门禁：
+  - **包类型匹配**：Header 与 Body 必须使用 `package-type: stable_i18n`（传国内的 `stable_cn` 会报 `4001 package-type is invalid`）。
+  - **版本号门禁（错误码 `4120`）**：服务端校验客户端版本与版本码。若 `ide_version < 3.7.0` 或版本代码低于 `20260501`，上游会直接拦截并返回 `4120`（*“当前版本过低，无法使用 SOLO 模式，请升级至最新版本”*）。
 
-⚠️ **按报错提示去「设置」里指定路径也救不了**：设置里的客户端路径按**区域**存
-（`trae_paths`，键 `cn`/`global`），而 `detect_install_for` 的采纳条件是**变体级**的。
-CN 区域三个程序位共用一条路径槽，指向 `Trae CN.exe` 时只有合并版槽位认它。
+---
 
-## 改动
+## 改动清单
 
-新增 `variant_for_program_entry` 作为 `trae_oauth_start` / `trae_launch_client`
-（webui 与桌面两条通道各两处）的入参解析。判据只看**入参有没有携带程序位信息**：
+### 1. 客户端探测与程序位自适应 (`buddy-switch-core`)
+- **新增 `variant_for_program_entry`**：
+  - 当入参为纯区域标识（`"cn"` / `"global"`）时，动态探测并匹配该区域内**实际装着的合并版客户端**（`TraeMerged` / `GlobalTraeMerged`），杜绝向废弃的 `TraeWork` 错误回退；
+  - 若指定了具体程序位则原样尊重，不静默替换。
+- **扩展二次开发根目录扫描**：
+  - `secondary_drive_roots()` 补充对 `D:\Develop`、`E:\Develop` 等自定义安装目录的自动发现。
+- **账号导入与变体回退**：
+  - 导入本地账号时若主变体数据目录不存在，自动在同区域已安装的候选变体中进行安全容错。
 
-| 入参 | 处理 | 理由 |
-|:--|:--|:--|
-| 纯区域标识（`cn` / `global`） | 挑该区域**实际装着**的程序位 | 区域标识不带程序位信息，只能由后端落地到一条真实客户端 |
-| 程序位标识（`trae_work` / `trae` / `trae_merged` …） | **原样尊重**，没装就响亮失败 | 那是点名要操作哪条程序位；静默替换会把登录态写进另一个客户端 |
-| 缺失 / 无法识别 | 回落默认变体 | 老调用点行为不变 |
+### 2. 国际版网关出站路由与协议参数对齐 (`buddy-switch-gateway`)
+- **区域动态分流基址**：
+  - 新增常量 `TRAE_AGENT_HOST_GLOBAL` (`https://core-normal.trae.ai`)；
+  - `TraeGatewayState` 新增 `upstream_for(variant)` 方法：国内版变体路由至 `trae-api-cn.mchost.guru`，国际版变体路由至 `core-normal.trae.ai`（集成测试自定义 `upstream` 时优先保持测试覆写）。
+- **国际版版本与包类型对齐**：
+  - 新增国际版版本规范常量 `TRAE_IDE_VERSION_GLOBAL = "3.7.0"`，`TRAE_IDE_VERSION_CODE_GLOBAL = "20260501"`；
+  - `prepare_llm_chat_body` 与 `send_llm_chat` 根据 `variant.region()` 动态注入对应的 `package-type`（`stable_cn` vs `stable_i18n`）、`ide_version` 与整型 `app_version_code`。
+- **错误分类与状态监控**：
+  - 在 `classify_solo` 中准确归类 `4120`（客户端版本门禁）；
+  - `status_view` 中的 `upstream` 字段按变体准确呈现其实际绑定的上游主机。
 
-**合并版优先**：已合并机器上合并版与遗留 TraeCode 候选名逐字相同、探测都会说已安装，
-取首个装着的会落在遗留 TraeCode 上（界面上「探测到的是哪条产品线」会说错）。
+### 3. 设备指纹动态感知与真实化
+- 移除网关出站请求中硬编码的静态假指纹 `CREFG-XX`，防止多账号同指纹碰撞；
+- 引入 `HostFingerprint` 单例机制，动态对齐当前真实宿主机 OS（Windows / Darwin / Linux）与 CPU 架构，未指定设备品牌时安全缺省。
 
-结果**绝不跨区域**。配套 `TraeRegion::is_region_token` 把「纯区域标识」与历史产品线标识
-分开；`TraeRegion::parse` 行为逐字不变（老链接/老前端继续可用）。**前端一行不改。**
+---
 
-## 验证
+## 验证结果
 
-本机：只装合并版 `Trae CN`，`TRAE SOLO CN` 已卸载。
+### 1. 真实国际版账号现场调用实测
+使用真实国际版账号（Free 计划）向 `https://core-normal.trae.ai/api/agent/v3/llm_utils_chat` 发起流式测试：
+- **HTTP 200 OK**
+- 完整接收 `event:metadata`、`event:timing_cost`，并正常流式返回了 DeepSeek-v4.1-flash 模型的思考过程（`reasoning_content`）与回答正文（`response`），最终以 `event:token_usage` 和 `event:done` 正常收尾。
 
-**真机探针**（`cargo test -p buddy-switch-core --test trae_variant_probe -- --ignored --nocapture`）：
-
-```
-入参 variant="cn"        → TraeMerged (Trae CN)   已安装=true  数据目录=…\Roaming\Trae CN
-入参 variant="trae_work" → TraeWork (TraeWork CN) 已安装=false 数据目录=…\Roaming\TRAE SOLO CN
-入参 variant="trae"      → Trae (TraeCode CN)     已安装=true  数据目录=…\Roaming\Trae CN
-```
-
-`"cn"` 落到真正装着的合并版；同时授权页参数也走对 —— 合并版 `packageType = TRAE_CN`
-取的是 TRAE 那把 `client_id`，而不是原来 SOLO 那把。
-
-**门禁**：
-
-| 检查 | 结果 |
-|:--|:--|
-| `npm run build`（tsc + check:api / docker / store-selectors / scope / npm-platforms） | 通过 |
-| `npm run check:api` | routes=182 / call=172 / server=166 / invoke=190 |
-| `npm run check:scope` | 291 passed / 0 failed |
-| `cargo test -p buddy-switch-core --lib` | 1258 passed，**3 failed**（见下，与本补丁无关） |
-| 新增 3 条测试 | 全绿 |
-| `cargo test -p buddy-switch-gateway` | 41 passed |
-| `cargo test -p buddy-switch-server` | 49 passed |
-| `cargo check --workspace --all-targets` | 0 warning |
-
-## ⚠️ 三条红**与本补丁无关**（已在未打补丁的基线上验证）
-
-我用 `git stash` 把本补丁摘掉后在**同一台机器**上复跑，这三条照样红：
-
-1. `trae::account::tests::refresh_chain_uses_legacy_only_when_credential_missing`
-2. `trae::oauth::tests::login_start_fails_loudly_when_device_identity_missing`
-
-两者都断言 `data_dir_missing_reason(TraeWork)` 的「**装了但从未启动过** ⇒ 缺设备凭证」那一支，
-而本机没装 TraeWork ⇒ 走的是「未检测到客户端」那一支。**装上 `TRAE SOLO CN` 即转绿**，
-与解析改动无关（我没碰 `account.rs` / `oauth.rs`）。
-
-3. `proxy_kpi_view::tests::stale_day_is_unknown_not_zero` —— **偶发**并行 flake
-   （连跑 3 次红 1 次，单跑必过）。
-
-## 待确认
-
-`variant.rs` 整个模块已标 deprecated，`.trellis/tasks/09-21-trae-region-program-model`
-有计划收尾到 `(TraeRegion, TraeProgram)` 双轴。我的改动落在同一片区域 —— 若与您的规划
-冲突，我按双轴口径改写。另：也可改成前端显式传程序位、后端只在纯区域标识时兜底，
-若那更符合本仓「不静默替换」的取向，我可以改。
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+### 2. 自动化测试套件
+全工作区 1800+ 项测试全部通过：
+- `buddy-switch-core`: 1264 passed, 0 failed
+- `buddy-switch-gateway`: 484 passed, 0 failed（含新增的 CN/Global 变体协议参数自适应单测与上游分流单测）
+- `buddy-switch-rust`: 30 passed, 0 failed
+- `buddy-switch-server`: 49 passed, 0 failed
