@@ -101,6 +101,9 @@ mod tests {
     #[test]
     fn stale_day_is_unknown_not_zero() {
         let path = stats_file();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let backup = std::fs::read_to_string(&path).ok();
         std::fs::write(
             &path,

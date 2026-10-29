@@ -80,9 +80,9 @@ pub const TRAE_LLM_CHAT_PATH: &str = "/api/agent/v3/llm_utils_chat";
 /// 客户端 App ID（参考实现硬编码值，非机密）。
 pub const TRAE_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 
-/// IDE 版本号与版本码，随上游校验字段一同下发。
-pub const TRAE_IDE_VERSION: &str = "0.1.50";
-pub const TRAE_IDE_VERSION_CODE: &str = "20260811";
+/// IDE 版本号与版本码，随上游校验字段一同下发（对齐最新 Trae CN 3.4.11 / 2.3.98528）。
+pub const TRAE_IDE_VERSION: &str = "3.4.11";
+pub const TRAE_IDE_VERSION_CODE: &str = "2.3.98528";
 
 /// `function` 字段取值 —— **按程序位分家**（2026-09-30 实测，issue #4「看得见、调不动」）。
 ///

@@ -830,6 +830,7 @@ async fn send_llm_chat(
         .header(header::USER_AGENT, TRAE_USER_AGENT)
         .header(header::REFERER, &url)
         .header("x-ide-token", &account.jwt)
+        .header(header::AUTHORIZATION, format!("Bearer {}", &account.jwt))
         .header("x-app-id", TRAE_APP_ID)
         .header("x-app-version", "default")
         .header("x-app-version-code", TRAE_IDE_VERSION_CODE)

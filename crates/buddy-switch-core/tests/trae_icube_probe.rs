@@ -172,3 +172,21 @@ fn probe_real_machine_icube_decryption() {
     );
     println!("\n✅ 真机 tc 解密链路验证通过（{checked} 条产品线）");
 }
+
+#[tokio::test]
+#[ignore = "探针：真实网络请求，用 --ignored 显式触发"]
+async fn probe_real_machine_refresh_exchange() {
+    println!("Testing refresh_jwt_for for TraeWork (fallback to installed Trae CN)...");
+    let res_work = buddy_switch_core::modules::trae::account::refresh_jwt_for(TraeVariant::TraeWork, "2496322698749472").await;
+    match res_work {
+        Ok(tok) => println!("✅ Success for TraeWork! Refreshed JWT (len={})", tok.len()),
+        Err(e) => println!("❌ Failed for TraeWork: {:?}", e),
+    }
+
+    println!("Testing refresh_jwt_for for Trae...");
+    let res_trae = buddy_switch_core::modules::trae::account::refresh_jwt_for(TraeVariant::Trae, "2496322698749472").await;
+    match res_trae {
+        Ok(tok) => println!("✅ Success for Trae! Refreshed JWT (len={})", tok.len()),
+        Err(e) => println!("❌ Failed for Trae: {:?}", e),
+    }
+}

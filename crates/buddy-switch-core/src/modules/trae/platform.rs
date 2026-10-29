@@ -289,7 +289,7 @@ pub fn data_dir_missing_reason(variant: super::variant::TraeVariant) -> String {
             exe.display()
         ),
         None => format!(
-            "未检测到【{line}】客户端：请先安装该客户端，\
+            "未检测到【{line}】客户端（缺少设备凭证）：请先安装该客户端，\
              或在「设置」里指定它的可执行文件路径，再重试。"
         ),
     }

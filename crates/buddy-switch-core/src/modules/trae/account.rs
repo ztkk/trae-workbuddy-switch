@@ -1299,7 +1299,22 @@ fn resolve_refresh_credential(
     device_id: Option<&str>,
 ) -> Result<DeviceCredential, icube::IcubeError> {
     match device_id.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(device_id) => icube::device_credential_by_device_id(variant, device_id),
+        Some(device_id) => {
+            let primary = icube::device_credential_by_device_id(variant, device_id);
+            if primary.is_ok() {
+                return primary;
+            }
+            // 同区域 fallback 机制：若在当前变体下找不到（如客户端升级合并后仅存 Trae CN 目录），
+            // 尝试在同区域偏好序的其他变体中按 device_id 查找。
+            for candidate in crate::modules::trae::platform::region_program_preference(variant.region()) {
+                if candidate != variant {
+                    if let Ok(cred) = icube::device_credential_by_device_id(candidate, device_id) {
+                        return Ok(cred);
+                    }
+                }
+            }
+            primary
+        }
         None => {
             // 留痕：不阻塞流程，但必须留下「这次没有绑定、是猜的」这个事实。
             store::append_log(
@@ -1310,7 +1325,19 @@ fn resolve_refresh_credential(
                     variant.display_name()
                 ),
             );
-            icube::device_credential_for(variant)
+            let primary = icube::device_credential_for(variant);
+            if primary.is_ok() {
+                return primary;
+            }
+            // 同区域 fallback 机制：当前变体目录缺失或未找到凭据时，尝试同区域偏好序的其他变体。
+            for candidate in crate::modules::trae::platform::region_program_preference(variant.region()) {
+                if candidate != variant {
+                    if let Ok(cred) = icube::device_credential_for(candidate) {
+                        return Ok(cred);
+                    }
+                }
+            }
+            primary
         }
     }
 }
@@ -1363,7 +1390,27 @@ pub(crate) async fn exchange_token_for(
     // 取值函数 —— 三处必须同源，否则等于拿 A 线的钥匙兑 B 线的 token。
     let client_id = crate::modules::trae::oauth_client::oauth_client()
         .client_id_for(variant.oauth_line());
-    let variants = build_refresh_variants(variant, client_id, refresh_token, credential.as_ref());
+    let mut variants = build_refresh_variants(variant, client_id, refresh_token, credential.as_ref());
+
+    // 若设备凭证跨变体回落（例如 TraeWork 账号回落读取了 Trae CN 凭证），
+    // 且凭证所属产品线的 ClientID 不同，将凭证所属变体的带 Proof 变体作为备选探测分支插入。
+    if let Some(ref cred) = credential {
+        if cred.variant != variant && cred.variant.oauth_line() != variant.oauth_line() {
+            let alt_client_id = crate::modules::trae::oauth_client::oauth_client()
+                .client_id_for(cred.variant.oauth_line());
+            let alt_variants =
+                build_refresh_variants(cred.variant, alt_client_id, refresh_token, Some(cred));
+            let legacy = variants.pop();
+            for v in alt_variants {
+                if v.tag != "Refresh/Legacy" {
+                    variants.push(v);
+                }
+            }
+            if let Some(leg) = legacy {
+                variants.push(leg);
+            }
+        }
+    }
 
     let mut errors: Vec<String> = Vec::new();
     let mut last_error: Option<RefreshExchangeError> = None;
