@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   BuddySwitch 一键打包 —— Windows NSIS 安装包（.exe）。
 
@@ -148,6 +148,13 @@ if (-not $cargoExe) { Fail "未找到 cargo.exe，请先安装 Rust 工具链 (h
 foreach ($d in @((Split-Path -Parent $cargoExe)) + $cargoDirs) {
   if ($d -and ([System.IO.Directory]::Exists($d)) -and (-not (($env:PATH -split ";") -contains $d))) {
     $env:PATH = "$d;$env:PATH"
+  }
+}
+
+# SQLCipher / OpenSSL 构建依赖 Strawberry Perl（Git 自带的 perl 缺 Params/Check.pm，见 build.yml）
+foreach ($sb in @("C:\Strawberry\perl\bin", "C:\Strawberry\c\bin", "D:\Strawberry\perl\bin", "D:\Strawberry\c\bin")) {
+  if ([System.IO.Directory]::Exists($sb) -and (-not (($env:PATH -split ";") -contains $sb))) {
+    $env:PATH = "$sb;$env:PATH"
   }
 }
 
