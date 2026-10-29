@@ -563,26 +563,41 @@ fn windows_install_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// 非系统盘上的 `<盘符>:\Programs`。
+/// 非系统盘上的常见安装目录（`<盘符>:\Programs`、`<盘符>:\Develop`、`<盘符>:\Apps` 等）。
 ///
 /// 上面那几个环境变量**只覆盖系统盘**，而 Trae 安装器允许自选目录，装到
-/// `D:\Programs\...` 是很常见的选择（实测本机就是 `D:\Programs\TRAE SOLO CN\`）。
-/// 此时自动探测会一无所获、界面显示「未安装」，而用户几乎不可能想到
-/// 「原因是它装在 D 盘」。
+/// `D:\Programs\...` 或开发者常用的 `D:\Develop\...` 很常见（实测本机国内版在
+/// `D:\Programs\TRAE SOLO CN\`，国际版在 `D:\Develop\Trae\`）。
+/// 此时自动探测若只看系统盘与 Programs 会一无所获、界面显示「未安装」，而用户很难想到
+/// 原因只是自选了非默认盘符或常用目录。
 ///
-/// 先对 `<盘符>:\Programs` 做一次 `is_dir()` 再展开：不存在的路径判定很快，
+/// 先对常见目录做一次 `is_dir()` 再展开：不存在的路径判定很快，
 /// 而展开后每个候选都要 `is_file()`，先过滤能把探测次数从
-/// 「盘符数 × 名字数 × exe 数」压到只剩真实存在的那些。`C:` 不重复探测
+/// 「盘符数 × 目录数 × 名字数 × exe 数」压到只剩真实存在的那些。`C:` 不重复探测
 /// （`%LOCALAPPDATA%\Programs` 与 `ProgramFiles` 已覆盖）。
 ///
 /// 已知代价：盘符里若挂着**已断开的网络驱动器**，`is_dir()` 可能要等超时。
 /// 这里接受该代价 —— 探测只发生在「环境状态」查询上，不是热路径。
 #[cfg(windows)]
 fn secondary_drive_roots() -> Vec<PathBuf> {
-    (b'D'..=b'Z')
-        .map(|letter| PathBuf::from(format!("{}:\\Programs", letter as char)))
-        .filter(|dir| dir.is_dir())
-        .collect()
+    const CANDIDATE_FOLDERS: &[&str] = &[
+        "Programs",
+        "Develop",
+        "Development",
+        "Dev",
+        "Apps",
+        "Software",
+    ];
+    let mut roots = Vec::new();
+    for letter in b'D'..=b'Z' {
+        for folder in CANDIDATE_FOLDERS {
+            let dir = PathBuf::from(format!("{}:\\{}", letter as char, folder));
+            if dir.is_dir() {
+                roots.push(dir);
+            }
+        }
+    }
+    roots
 }
 
 /// 从「可执行文件所在目录」推导版本号。
@@ -2950,6 +2965,18 @@ mod tests {
             assert!(
                 !text.starts_with("C:"),
                 "C 盘不应出现在非系统盘根目录里：{text}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn candidate_paths_includes_develop_folder_if_present() {
+        let candidates = candidate_paths_for(&["Trae"], &["Trae.exe"]);
+        if std::path::Path::new("D:\\Develop").is_dir() {
+            assert!(
+                candidates.contains(&std::path::PathBuf::from("D:\\Develop\\Trae\\Trae.exe")),
+                "候选路径列表应包含 D:\\Develop\\Trae\\Trae.exe: {candidates:?}"
             );
         }
     }
