@@ -365,15 +365,28 @@ pub fn import_local_login_for(variant: TraeVariant) -> Result<LocalLogin, String
     // 目录选择：**先**「装着登录态的候选」，**取不到才**回落「最近活跃的候选」。
     // 顺序不可调换（理由见函数文档）。
     //
-    // ⚠️ 这里刻意**不抽成函数**：只有一个调用点、一行逻辑；抽出去会让「唯一取值点」
-    // 的命名空间（`*_dir_for`）多一个同形符号，误导静态检查（`check_round3.py` 的 R1-1
-    // 正是按 `fn *_dir_for` 找取值点）与后来的读者。
-    let data_dir = icube::login_state_dir_for(variant)
+    // 若当前变体未找到数据目录（例如前端/旧接口传了区域默认的 TraeWork/Global，但本机只装了合并版 Trae），
+    // 允许在同区域其他候选变体中回退查找可用目录。
+    let mut resolved = icube::login_state_dir_for(variant)
         .or_else(|| platform::select_data_dir_for(variant))
+        .map(|d| (d, variant));
+
+    if resolved.is_none() {
+        for alt in platform::region_program_preference(variant.region()) {
+            if alt != variant {
+                if let Some(dir) = icube::login_state_dir_for(alt).or_else(|| platform::select_data_dir_for(alt)) {
+                    resolved = Some((dir, alt));
+                    break;
+                }
+            }
+        }
+    }
+
+    let (data_dir, effective_variant) = resolved
         // 与 OAuth 侧**共用同一条**「为什么读不到」的解释（区分「没装」/「装了但从没启动过」）。
         // 两个入口各拼一套说法，迟早会出现「一个说没装、另一个说没启动」的自相矛盾。
         .ok_or_else(|| platform::data_dir_missing_reason(variant))?;
-    local_login_from_dir(&data_dir, variant)
+    local_login_from_dir(&data_dir, effective_variant)
 }
 
 /// 从**指定数据目录**读登录态（显式入参）—— 导入侧的**唯一实现**。

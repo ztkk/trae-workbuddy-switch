@@ -246,13 +246,18 @@ pub fn region_program_preference(region: super::region::TraeRegion) -> [super::v
 ///
 /// ## 不编造事实
 ///
-/// 判据就是 [`detect_install_for`]；一个都没装时返回该区域的**主程序位**
-/// （遗留 TraeWork，改造前的默认），好让下游的「未检测到【…】客户端」文案有名字可报。
+/// 判据优先使用 [`detect_install_for`]（exe 存在）；若自定义 exe 路径尚未探测到，
+/// 则次选已有活跃数据目录（[`select_data_dir_for`]，storage.json 存在）的程序位；
+/// 一个都没装且无数据目录时返回该区域的首选程序位（合并版 Trae，不再回落已被废弃并合并的旧版 TraeWork）。
 pub fn installed_variant_in_region(region: super::region::TraeRegion) -> super::variant::TraeVariant {
-    region_program_preference(region)
-        .into_iter()
-        .find(|variant| detect_install_for(*variant).installed)
-        .unwrap_or_else(|| variant_for_program(region, super::region::TraeProgram::TraeWork))
+    let preference = region_program_preference(region);
+    if let Some(&variant) = preference.iter().find(|v| detect_install_for(**v).installed) {
+        return variant;
+    }
+    if let Some(&variant) = preference.iter().find(|v| select_data_dir_for(**v).is_some()) {
+        return variant;
+    }
+    preference[0]
 }
 
 /// 「该变体没有数据目录」时的**用户可读原因**。
@@ -3102,7 +3107,7 @@ mod tests {
     /// - 结果要么**真的装着**，要么是该区域的主程序位兜底（一个都没装时的报错口径）。
     #[test]
     fn installed_variant_in_region_stays_in_region_and_never_fakes_installed() {
-        use super::super::region::{TraeProgram, TraeRegion};
+        use super::super::region::TraeRegion;
 
         // `detect_install_for` 内部会读 settings（落 `BUDDY_SWITCH_HOME`），
         // 与其它读环境的用例一样持 `env_lock()`，免得被并发改走 home 造成假失败。
@@ -3115,10 +3120,12 @@ mod tests {
                 region,
                 "区域解析结果跨了区域：{region:?} → {resolved:?}"
             );
-            let main_program = variant_for_program(region, TraeProgram::TraeWork);
+            let fallback_program = region_program_preference(region)[0];
             assert!(
-                detect_install_for(resolved).installed || resolved == main_program,
-                "{region:?} 解析出 {resolved:?}，但它既没装、也不是该区域的主程序位兜底"
+                detect_install_for(resolved).installed
+                    || select_data_dir_for(resolved).is_some()
+                    || resolved == fallback_program,
+                "{region:?} 解析出 {resolved:?}，但它既没装、也没有数据目录、也不是该区域的首选程序位兜底"
             );
         }
     }

@@ -919,7 +919,7 @@ async fn api_accounts_import_local(Json(body): Json<Value>) -> Response {
         }
         Product::Trae => {
             let variant = match require_trae_region(scope) {
-                Ok(region) => trae_variant_of_region(region),
+                Ok(region) => trae::platform::installed_variant_in_region(region),
                 Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
             };
             match tokio::task::spawn_blocking(move || {
@@ -2903,7 +2903,8 @@ async fn api_trae_delete_account(Json(body): Json<Value>) -> Response {
 /// 之类的目录名），决定读哪条产品线的 userData；**缺失时回落默认变体**，
 /// 保证旧调用点行为不变。
 async fn api_trae_import_local(Json(body): Json<Value>) -> Response {
-    let variant = parse_trae_variant(body.get("variant").and_then(Value::as_str));
+    let variant =
+        trae::handlers::variant_for_program_entry(body.get("variant").and_then(Value::as_str));
     match tokio::task::spawn_blocking(move || trae::handlers::import_local_account_for(variant)).await
     {
         Ok(Ok(value)) => json_ok(value),

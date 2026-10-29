@@ -489,7 +489,7 @@ pub async fn accounts_import_local(scope: String) -> Result<Value, String> {
             .map_err(|error| format!("导入本机账号失败: {error}"))?
         }
         Product::Trae => {
-            let variant = trae_variant_of_region(require_trae_region(scope)?);
+            let variant = trae::platform::installed_variant_in_region(require_trae_region(scope)?);
             tauri::async_runtime::spawn_blocking(move || {
                 trae::handlers::import_local_account_for(variant)
             })
@@ -2739,7 +2739,7 @@ pub async fn trae_delete_account(
 /// 保证老调用点行为不变。命令名不变，仅新增参数。
 #[tauri::command]
 pub async fn trae_import_local_account(variant: Option<String>) -> Result<Value, String> {
-    let variant = parse_trae_variant(variant.as_deref());
+    let variant = trae::handlers::variant_for_program_entry(variant.as_deref());
     tauri::async_runtime::spawn_blocking(move || trae::handlers::import_local_account_for(variant))
         .await
         .map_err(|error| format!("导入本机账号失败: {error}"))?
@@ -3135,7 +3135,7 @@ pub fn delete_trae_api_key(id: String) -> Result<Value, String> {
 /// 形状（`{ok,path}` 或结构化 `Unsupported`）由 `handlers::open_data_dir` 唯一产出。
 #[tauri::command]
 pub fn open_trae_data_dir(variant: Option<String>) -> Result<Value, String> {
-    trae::handlers::open_data_dir(parse_trae_variant(variant.as_deref()))
+    trae::handlers::open_data_dir(trae::handlers::variant_for_program_entry(variant.as_deref()))
 }
 
 /// POST /api/trae/launch-client —— 启动**该变体**的 Trae 客户端（OAuth 的前置动作）。
