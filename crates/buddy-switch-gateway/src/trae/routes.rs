@@ -808,6 +808,65 @@ async fn attempt_once(
     }
 }
 
+/// 宿主机动态设备指纹信息（单例缓存，与真实宿主机环境对齐，消除任何硬编码假特征）。
+#[derive(Debug, Clone)]
+struct HostFingerprint {
+    device_type: &'static str,
+    device_cpu: &'static str,
+    device_brand: Option<String>,
+    os_version: &'static str,
+}
+
+fn host_fingerprint() -> &'static HostFingerprint {
+    static CACHE: std::sync::OnceLock<HostFingerprint> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let device_type = match std::env::consts::OS {
+            "windows" => "windows",
+            "macos" => "darwin",
+            "linux" => "linux",
+            other => other,
+        };
+
+        let device_cpu = if cfg!(target_arch = "aarch64") {
+            if cfg!(target_os = "macos") {
+                "Apple"
+            } else {
+                "ARM"
+            }
+        } else {
+            let proc_id = std::env::var("PROCESSOR_IDENTIFIER")
+                .unwrap_or_default()
+                .to_uppercase();
+            if proc_id.contains("AMD") {
+                "AMD"
+            } else {
+                "Intel"
+            }
+        };
+
+        let os_version = match std::env::consts::OS {
+            "windows" => "Windows 11",
+            "macos" => "macOS",
+            "linux" => "Linux",
+            _ => "Unknown",
+        };
+
+        // 允许通过环境变量指定设备型号；若未显式指定，默认留空不发送 x-device-brand
+        // （逐字对齐客户端源码 d.device_model && header 的安全策略，彻底杜绝 CREFG-XX 等假指纹特征碰撞）。
+        let device_brand = std::env::var("BUDDY_SWITCH_DEVICE_BRAND")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        HostFingerprint {
+            device_type,
+            device_cpu,
+            device_brand,
+            os_version,
+        }
+    })
+}
+
 /// 发一次 `llm_utils_chat`：拿到响应头即返回，不读 body。
 ///
 /// 头部逐字对齐参考实现（`x-ide-token` 用裸 JWT，**不带** `Cloud-IDE-JWT ` 前缀，
@@ -820,8 +879,9 @@ async fn send_llm_chat(
 ) -> Result<reqwest::Response, (u16, String)> {
     let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream);
     let trace_id = trace_id();
+    let fp = host_fingerprint();
 
-    let response = state
+    let mut req = state
         .http
         .post(&url)
         .header(header::CONTENT_TYPE, "application/json")
@@ -837,17 +897,16 @@ async fn send_llm_chat(
         .header("x-ide-version", TRAE_IDE_VERSION)
         .header("x-ide-version-code", TRAE_IDE_VERSION_CODE)
         .header("x-ide-version-type", "stable")
-        .header("x-device-type", "windows")
-        .header("x-device-brand", "CREFG-XX")
-        .header("x-device-cpu", "Intel")
+        .header("x-device-type", fp.device_type)
+        .header("x-device-cpu", fp.device_cpu)
         .header("x-device-id", &account.device_id)
         .header("x-machine-id", &account.machine_id)
-        .header("x-os-version", "Windows 11 Home China")
+        .header("x-os-version", fp.os_version)
         .header("request-traffic-type", "prod")
         .header("package-type", "stable_cn")
         .header("x-lgw-req-sdk-type", "3")
         .header("x-lscbd-aid", "787976")
-        .header("x-lscbd-platform", "windows")
+        .header("x-lscbd-platform", fp.device_type)
         .header("x-ss-dp", "787976")
         .header("app-version", TRAE_IDE_VERSION)
         .header("x-custom-trace-id", &trace_id[..16])
@@ -857,7 +916,13 @@ async fn send_llm_chat(
         )
         .header("x-tt-trace-id", &trace_id)
         .header("x-request-id", format!("req_{}", uuid_like()))
-        .body(body.to_vec())
+        .body(body.to_vec());
+
+    if let Some(ref brand) = fp.device_brand {
+        req = req.header("x-device-brand", brand);
+    }
+
+    let response = req
         .send()
         .await
         .map_err(|error| (0u16, describe_transport_error(&error)))?;
