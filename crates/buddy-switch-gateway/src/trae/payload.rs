@@ -19,13 +19,11 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 
 use buddy_switch_core::modules::trae::model_list::ClientModelList;
+use buddy_switch_core::modules::trae::platform::ClientProductVersion;
 use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
 
-use super::{
-    function_for, TRAE_APP_ID, TRAE_DEFAULT_MODEL, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE,
-    TRAE_IDE_VERSION_CODE_GLOBAL, TRAE_IDE_VERSION_GLOBAL,
-};
+use super::{function_for, TRAE_APP_ID, TRAE_DEFAULT_MODEL};
 
 /// 模型名映射：`模型名 → (config_name, model_name)`。
 ///
@@ -291,10 +289,14 @@ pub fn wants_stream(body: &Value) -> bool {
 /// 上游按 `function` 做白名单，写死一个会让另一条产品线的模型全部
 /// `4001 param is invalid`（issue #4 的实测现场）。
 ///
+/// `version` 是「IDE 版本 + 版本码」，由调用方经 [`super::client_version_for`] 取
+/// （已安装客户端优先、常量兜底）：本函数不自己读盘，保持纯函数、测试可钉值。
+///
 /// `src` 不是合法 JSON 对象时原样返回（交给上游报错，而不是在这里吞掉）。
 pub fn prepare_llm_chat_body(
     src: &[u8],
     variant: TraeVariant,
+    version: &ClientProductVersion,
     default_model: &str,
     uid: &str,
     device_id: &str,
@@ -336,25 +338,16 @@ pub fn prepare_llm_chat_body(
     object.insert("workspace_id".into(), json!("e04cdd"));
     object.insert("prompt_max_tokens".into(), json!(168_000));
     object.insert("mode".into(), json!("FunctionCall"));
-    let is_global = variant.region() == TraeRegion::Global;
-    let ide_version = if is_global {
-        TRAE_IDE_VERSION_GLOBAL
-    } else {
-        TRAE_IDE_VERSION
-    };
-    let ide_version_code = if is_global {
-        TRAE_IDE_VERSION_CODE_GLOBAL
-    } else {
-        TRAE_IDE_VERSION_CODE
-    };
-    let package_type = if is_global {
+    // 版本对由调用方解析（已安装客户端 `product.json` 优先），这里只负责写入。
+    // 版本码必须是纯数字 —— 上游按整型绑定 `app_version_code`。
+    let package_type = if variant.region() == TraeRegion::Global {
         "stable_i18n"
     } else {
         "stable_cn"
     };
 
-    object.insert("ide_version".into(), json!(ide_version));
-    object.insert("ide_version_code".into(), json!(ide_version_code));
+    object.insert("ide_version".into(), json!(&version.ide_version));
+    object.insert("ide_version_code".into(), json!(&version.version_code));
     object.insert("app_id".into(), json!(TRAE_APP_ID));
     object.insert("package_type".into(), json!(package_type));
 
@@ -494,14 +487,34 @@ mod tests {
     use super::*;
     // 两个 `function` 常量只被断言用到（lib 侧经 `function_for` 取），
     // 故**只在测试模块导入** —— 放顶层会得到 `unused_imports` 警告。
-    use crate::trae::{TRAE_FUNCTION_CHAT_V3, TRAE_FUNCTION_SOLO_WORK};
+    use crate::trae::{
+        TRAE_FUNCTION_CHAT_V3, TRAE_FUNCTION_SOLO_WORK, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE,
+        TRAE_IDE_VERSION_CODE_GLOBAL, TRAE_IDE_VERSION_GLOBAL,
+    };
     use buddy_switch_core::modules::trae::model_list::{ClientModel, ClientModelGroup};
+
+    /// 测试里显式钉住兜底版本对：`prepare_llm_chat_body` 是纯函数，
+    /// 不读盘 ⇒ 断言不随「本机装了哪个版本的客户端」而变。
+    fn cn_version() -> ClientProductVersion {
+        ClientProductVersion {
+            ide_version: TRAE_IDE_VERSION.to_string(),
+            version_code: TRAE_IDE_VERSION_CODE.to_string(),
+        }
+    }
+
+    fn global_version() -> ClientProductVersion {
+        ClientProductVersion {
+            ide_version: TRAE_IDE_VERSION_GLOBAL.to_string(),
+            version_code: TRAE_IDE_VERSION_CODE_GLOBAL.to_string(),
+        }
+    }
 
     fn prepared(body: Value) -> Value {
         let bytes = serde_json::to_vec(&body).unwrap();
         let out = prepare_llm_chat_body(
             &bytes,
             TraeVariant::TraeWork,
+            &cn_version(),
             "deepseek-v4-flash",
             "u1",
             "dev1",
@@ -677,13 +690,13 @@ mod tests {
     fn invalid_json_is_passed_through_untouched() {
         let raw = b"not json at all";
         assert_eq!(
-            prepare_llm_chat_body(raw, TraeVariant::TraeWork, "m", "u", "d", "m"),
+            prepare_llm_chat_body(raw, TraeVariant::TraeWork, &cn_version(), "m", "u", "d", "m"),
             raw.to_vec()
         );
         // 合法 JSON 但不是对象，同样原样返回。
         let array = b"[1,2,3]";
         assert_eq!(
-            prepare_llm_chat_body(array, TraeVariant::TraeWork, "m", "u", "d", "m"),
+            prepare_llm_chat_body(array, TraeVariant::TraeWork, &cn_version(), "m", "u", "d", "m"),
             array.to_vec()
         );
     }
@@ -841,6 +854,7 @@ mod tests {
         let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
             &bytes,
             TraeVariant::Trae,
+            &cn_version(),
             "glm-5.3-flash",
             "u1",
             "dev1",
@@ -854,7 +868,11 @@ mod tests {
         assert_eq!(out["model_name"], "glm-5.3-flash__dev");
     }
 
-    /// ★ 护栏：CN 与 Global 请求体的 package_type / ide_version / ide_version_code 自适应。
+    /// ★ 端到端（构造层）：写进请求体的版本对**就是调用方解析出来的那一对**，
+    /// `package_type` 仍按区域分家。
+    ///
+    /// 版本对本身由 [`super::client_version_for`] 解析（客户端 `product.json` 优先），
+    /// 这里传显式值，断言才不随「本机装了哪个版本」漂移。
     #[test]
     fn payload_adapts_to_region_spec() {
         let bytes = serde_json::to_vec(&json!({
@@ -866,6 +884,7 @@ mod tests {
         let cn_out: Value = serde_json::from_slice(&prepare_llm_chat_body(
             &bytes,
             TraeVariant::TraeMerged,
+            &cn_version(),
             "deepseek-v4.1-flash",
             "u1",
             "dev1",
@@ -879,6 +898,7 @@ mod tests {
         let global_out: Value = serde_json::from_slice(&prepare_llm_chat_body(
             &bytes,
             TraeVariant::GlobalTraeMerged,
+            &global_version(),
             "deepseek-v4.1-flash",
             "u1",
             "dev1",

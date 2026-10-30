@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use buddy_switch_core::modules::trae::account;
+use buddy_switch_core::modules::trae::platform::ClientProductVersion;
 use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
 
@@ -44,9 +45,7 @@ use super::payload;
 use super::pool::{classify_http, classify_solo, PickedTraeAccount, TraeErrKind, TraePool};
 use super::sse::{self, TokenUsage};
 use super::{
-    now_secs, TraeGatewayState, TRAE_APP_ID, TRAE_IDE_VERSION,
-    TRAE_IDE_VERSION_CODE, TRAE_IDE_VERSION_CODE_GLOBAL, TRAE_IDE_VERSION_GLOBAL,
-    TRAE_LLM_CHAT_PATH,
+    client_version_for, now_secs, TraeGatewayState, TRAE_APP_ID, TRAE_LLM_CHAT_PATH,
 };
 
 /// 请求扩展：承载 Bearer Key 的**归属标识**，供 handler 选择对应的账号池与 `function`。
@@ -755,16 +754,21 @@ async fn attempt_once(
     }?;
     tried.insert(picked.uid.clone());
 
+    // 版本对**每一次尝试解析一次**，请求头与请求体共用同一份：
+    // 优先已安装客户端 `product.json`，取不到回落常量（见 [`client_version_for`]）。
+    let version = client_version_for(variant);
+
     let converted = payload::prepare_llm_chat_body(
         body,
         variant,
+        &version,
         default_model,
         &picked.uid,
         &picked.device_id,
         &picked.machine_id,
     );
 
-    match send_llm_chat(state, variant, &picked, &converted).await {
+    match send_llm_chat(state, variant, &picked, &converted, &version).await {
         Ok(response) => {
             // 会话粘性：**只在成功之后**绑定，让下一轮优先复用这个账号。
             state.bind_sticky(sticky_key, &picked.uid).await;
@@ -878,23 +882,17 @@ async fn send_llm_chat(
     variant: TraeVariant,
     account: &PickedTraeAccount,
     body: &[u8],
+    version: &ClientProductVersion,
 ) -> Result<reqwest::Response, (u16, String)> {
     let url = format!("{}{TRAE_LLM_CHAT_PATH}", state.upstream_for(variant));
     let trace_id = trace_id();
     let fp = host_fingerprint();
 
-    let is_global = variant.region() == TraeRegion::Global;
-    let ide_version = if is_global {
-        TRAE_IDE_VERSION_GLOBAL
-    } else {
-        TRAE_IDE_VERSION
-    };
-    let ide_version_code = if is_global {
-        TRAE_IDE_VERSION_CODE_GLOBAL
-    } else {
-        TRAE_IDE_VERSION_CODE
-    };
-    let package_type = if is_global {
+    // 版本对来自 [`client_version_for`]（客户端 `product.json` 优先、常量兜底）。
+    // 版本码必须是纯数字 —— 上游按整型绑定 `app_version_code`。
+    let ide_version = version.ide_version.as_str();
+    let ide_version_code = version.version_code.as_str();
+    let package_type = if variant.region() == TraeRegion::Global {
         "stable_i18n"
     } else {
         "stable_cn"
@@ -1551,9 +1549,11 @@ mod tests {
             let src = format!(
                 r#"{{"model":"{config_name}","messages":[{{"role":"user","content":"ping"}}]}}"#
             );
+            let version = client_version_for(TraeVariant::TraeWork);
             let converted = payload::prepare_llm_chat_body(
                 src.as_bytes(),
                 TraeVariant::TraeWork,
+                &version,
                 config_name,
                 &picked.uid,
                 &picked.device_id,
@@ -1567,7 +1567,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, TraeVariant::TraeWork, &picked, &encoded).await {
+            match send_llm_chat(&state, TraeVariant::TraeWork, &picked, &encoded, &version).await {
                 Ok(mut response) => {
                     // 累积若干块，直到看见 `event:metadata`（上游认了）或 `event:error`（上游拒了）。
                     // ⚠️ 只看**首块**会把 `event:progress_notice`（排队中）误判成结论 —— 踩过。
@@ -1658,9 +1658,11 @@ mod tests {
         for name in names {
             let (config_name, model_name) = payload::model_config(&name);
             let src = format!(r#"{{"model":"{name}","messages":[{{"role":"user","content":"ping"}}]}}"#);
+            let version = client_version_for(TraeVariant::TraeWork);
             let converted = payload::prepare_llm_chat_body(
                 src.as_bytes(),
                 TraeVariant::TraeWork,
+                &version,
                 &name,
                 &picked.uid,
                 &picked.device_id,
@@ -1672,7 +1674,7 @@ mod tests {
             body["model_name"] = serde_json::json!(model_name);
             let encoded = serde_json::to_vec(&body).expect("序列化");
 
-            match send_llm_chat(&state, TraeVariant::TraeWork, &picked, &encoded).await {
+            match send_llm_chat(&state, TraeVariant::TraeWork, &picked, &encoded, &version).await {
                 Ok(mut response) => {
                     let mut buffer = String::new();
                     let mut verdict = "超时".to_string();

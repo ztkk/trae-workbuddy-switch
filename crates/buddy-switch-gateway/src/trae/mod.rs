@@ -45,6 +45,7 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 
 use buddy_switch_core::modules::config as core_config;
 use buddy_switch_core::modules::region::Region;
+use buddy_switch_core::modules::trae::platform::{self, ClientProductVersion};
 use buddy_switch_core::modules::trae::region::TraeRegion;
 use buddy_switch_core::modules::trae::variant::TraeVariant;
 
@@ -80,13 +81,62 @@ pub const TRAE_LLM_CHAT_PATH: &str = "/api/agent/v3/llm_utils_chat";
 /// 客户端 App ID（参考实现硬编码值，非机密）。
 pub const TRAE_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 
-/// IDE 版本号与版本码，随上游校验字段一同下发（对齐最新 Trae CN 3.4.11 / 2.3.98528）。
+/// IDE 版本号与版本码的**兜底常量**（正常路径见 [`client_version_for`]）。
+///
+/// 出站请求优先用已安装客户端 `product.json` 里的实时值，这两个常量只在
+/// 读不到客户端、或客户端版本码比这里更旧时生效。
+///
+/// 版本码的口径是**构建日期**（`YYYYMMDD`），取自 `product.json` 的 `date`。
+/// 上游按它做最低版本门禁 —— 2026-10-30 实测同一账号、同一模型：
+/// `20250325`（`traeVersionCode`）所有模型一律 `4001 param is invalid`，
+/// `20260811` / `20261028` 均正常出流。别再拿 `traeVersionCode`
+/// 或 `tronBuildVersion` 当版本码（见
+/// `tests::fallback_client_versions_keep_numeric_codes`）。
 pub const TRAE_IDE_VERSION: &str = "3.4.11";
-pub const TRAE_IDE_VERSION_CODE: &str = "2.3.98528";
+pub const TRAE_IDE_VERSION_CODE: &str = "20260811";
 
-/// Trae 国际版 IDE 版本号与版本码（实测对齐国际版服务端版本门禁 3.7.0 / 20260501）。
+/// Trae 国际版 IDE 版本号与版本码的兜底常量
+/// （实测对齐国际版服务端版本门禁 3.7.0 / 20260501）。
 pub const TRAE_IDE_VERSION_GLOBAL: &str = "3.7.0";
 pub const TRAE_IDE_VERSION_CODE_GLOBAL: &str = "20260501";
+
+/// 出站请求用的「IDE 版本 + 版本码」。
+///
+/// 优先取**已安装客户端**的 `product.json`（`appVersion` / `date`），读不到才回落
+/// `fallback_client_version`。版本码取「客户端构建日期」与兜底常量中**较新**的一个：
+/// 上游做的是最低版本门禁，旧客户端算出来的日期不该把请求拉回已失效的下限。
+pub fn client_version_for(variant: TraeVariant) -> ClientProductVersion {
+    let fallback = fallback_client_version(variant.region());
+    let Some(installed) = platform::client_product_version_for(variant) else {
+        return fallback;
+    };
+    ClientProductVersion {
+        version_code: newer_version_code(&installed.version_code, &fallback.version_code),
+        ide_version: installed.ide_version,
+    }
+}
+
+/// 取两个 `YYYYMMDD` 版本码里较新的一个；客户端值不可解析时用兜底常量（不编值）。
+fn newer_version_code(installed: &str, floor: &str) -> String {
+    match (installed.parse::<i64>(), floor.parse::<i64>()) {
+        (Ok(installed), Ok(floor)) if installed < floor => floor.to_string(),
+        (Err(_), _) => floor.to_string(),
+        _ => installed.to_string(),
+    }
+}
+
+/// 读不到客户端时的兜底版本对（按区域分家；两个版本码都必须是纯数字）。
+fn fallback_client_version(region: TraeRegion) -> ClientProductVersion {
+    let (ide_version, version_code) = if region == TraeRegion::Global {
+        (TRAE_IDE_VERSION_GLOBAL, TRAE_IDE_VERSION_CODE_GLOBAL)
+    } else {
+        (TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE)
+    };
+    ClientProductVersion {
+        ide_version: ide_version.to_string(),
+        version_code: version_code.to_string(),
+    }
+}
 
 /// `function` 字段取值 —— **按程序位分家**（2026-09-30 实测，issue #4「看得见、调不动」）。
 ///
@@ -961,5 +1011,47 @@ mod tests {
         custom_state.upstream = "http://127.0.0.1:9999".to_string();
         assert_eq!(custom_state.upstream_for(TraeVariant::TraeWork), "http://127.0.0.1:9999");
         assert_eq!(custom_state.upstream_for(TraeVariant::GlobalTraeMerged), "http://127.0.0.1:9999");
+    }
+
+    /// ★★ 护栏：兜底版本码必须是**纯数字**，且不低于上游已验证可用的下限。
+    ///
+    /// 反例（改坏会红，2026-10-30 上游实测）：
+    /// - 填 `traeVersionCode`（`20250325`）⇒ 低于最低版本门禁，13/13 个模型回
+    ///   `4001 param is invalid`；
+    /// - 填 `tronBuildVersion`（`2.3.98528`）⇒ 带点，binding 阶段直接 400。
+    ///
+    /// 这里只钉**兜底常量**；「读得到客户端时用实时值」由
+    /// `platform::client_product_version_for` 自己的用例钉住（纯路径读取，不受本机安装影响）。
+    #[test]
+    fn fallback_client_versions_keep_numeric_codes() {
+        for (region, ide_version, version_code) in [
+            (TraeRegion::Cn, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE),
+            (
+                TraeRegion::Global,
+                TRAE_IDE_VERSION_GLOBAL,
+                TRAE_IDE_VERSION_CODE_GLOBAL,
+            ),
+        ] {
+            let version = fallback_client_version(region);
+            assert_eq!(version.ide_version, ide_version, "{region:?} 的兜底版本号");
+            assert_eq!(version.version_code, version_code, "{region:?} 的兜底版本码");
+            assert!(
+                version.version_code.parse::<i64>().is_ok(),
+                "{region:?} 的兜底版本码必须是纯数字：{:?}",
+                version.version_code
+            );
+        }
+    }
+
+    /// ★ 护栏：客户端算出的版本码**不得把请求拉回已失效的下限**。
+    ///
+    /// 上游是最低版本门禁：比兜底常量更旧的客户端日期照样会被 4001 拒，
+    /// 所以取两者较大者；客户端值异常时直接用兜底常量。
+    #[test]
+    fn installed_version_code_never_goes_below_the_floor() {
+        assert_eq!(newer_version_code("20261028", "20260811"), "20261028", "更新的客户端");
+        assert_eq!(newer_version_code("20260701", "20260811"), "20260811", "更旧的客户端");
+        assert_eq!(newer_version_code("20260811", "20260811"), "20260811");
+        assert_eq!(newer_version_code("not-a-code", "20260811"), "20260811", "异常值回落兜底");
     }
 }

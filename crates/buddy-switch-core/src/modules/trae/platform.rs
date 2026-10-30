@@ -29,8 +29,10 @@
 //! （见 [`data_dir_names_by_activity`]），并在返回的结构里带上实际命中的路径，
 //! 便于用户核对。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
@@ -712,6 +714,142 @@ pub fn client_install_meta_for(variant: super::variant::TraeVariant) -> Option<C
         build_version: field("buildVersion").unwrap_or_default(),
         channel: field("channel").unwrap_or_default(),
     })
+}
+
+/// 客户端 `resources/app/product.json` 里、**发往上游**要用的版本对。
+///
+/// ## 为什么是这两个字段（2026-10-30 真机 + 上游实测）
+///
+/// 上游对版本码做的是**最低版本门禁**，口径是「构建日期」的数值 —— 实测同一账号、
+/// 同一模型下：版本码 `20250325` 一律被 `4001 param is invalid` 拒，
+/// 而 `20260811` / `20261028` 都能正常出流。`product.json` 里三个「版本」只有一个对得上：
+///
+/// | 字段 | 本机实测（Trae CN 3.4.11） | 用途 |
+/// |:--|:--|:--|
+/// | `appVersion` | `3.4.11` | `x-ide-version` / `ide_version` |
+/// | `date` | `2026-10-28T09:47:39.271Z` | 版本码来源（取 `20261028`） |
+/// | `traeVersionCode` | `20250325` | ❌ **不是**上游要的版本码（低于门禁，必被 4001 拒） |
+/// | `tronBuildVersion` | `2.3.98528` | ❌ 构建号，不是版本码（带点，binding 阶段就 400） |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientProductVersion {
+    /// `product.json` → `appVersion`。
+    pub ide_version: String,
+    /// `product.json` → `date` 的 `YYYYMMDD` 形态（纯数字）。
+    pub version_code: String,
+}
+
+/// 版本对缓存有效期：热路径每次出站都要取一次，而探测要扫多个安装根（含其它盘符）；
+/// 一分钟足够跟上客户端升级，又不把探测留在聊天路径上。
+const PRODUCT_VERSION_TTL: Duration = Duration::from_secs(60);
+
+/// 读该变体客户端的版本对（读不到该变体时，按同区域程序位偏好序回退）。
+///
+/// 回退是必要的：客户端合并后 `TRAE SOLO CN` 被卸载、只剩 `Trae CN`，而网关的
+/// `TraeWork` 变体仍按自己的 exe 名探测 —— 不回退就会永远取不到真实值。
+///
+/// 取不到或字段不可用 ⇒ `None`，由调用方回落到常量（不在这里编默认值）。
+pub fn client_product_version_for(
+    variant: super::variant::TraeVariant,
+) -> Option<ClientProductVersion> {
+    static CACHE: OnceLock<
+        Mutex<HashMap<super::variant::TraeVariant, (Instant, Option<ClientProductVersion>)>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, cached)) = cache.get(&variant) {
+        if at.elapsed() < PRODUCT_VERSION_TTL {
+            return cached.clone();
+        }
+    }
+    let probed = probe_client_product_version(variant);
+    cache.insert(variant, (Instant::now(), probed.clone()));
+    probed
+}
+
+/// 先试变体自己，再按同区域程序位偏好序试其余程序位。
+fn probe_client_product_version(
+    variant: super::variant::TraeVariant,
+) -> Option<ClientProductVersion> {
+    let mut candidates = vec![variant];
+    for candidate in region_program_preference(variant.region()) {
+        if candidate != variant {
+            candidates.push(candidate);
+        }
+    }
+    candidates.into_iter().find_map(|candidate| {
+        let exe = detect_install_for(candidate).exe?;
+        product_version_from_exe(&exe)
+    })
+}
+
+/// 从**可执行文件路径**推导版本对（口径同 [`version_from_exe`]：先取父目录）。
+fn product_version_from_exe(exe: &Path) -> Option<ClientProductVersion> {
+    exe.parent().and_then(product_version_from_install_dir)
+}
+
+/// 从安装根目录读 `product.json`：Windows / Linux 是 `resources/app/`，
+/// macOS bundle 是 `Contents/Resources/app/`（与 [`version_from_install_dir`] 同布局）。
+///
+/// 版本码由 `date` 推导（见 [`version_code_from_build_date`]）—— 这是上游「最低版本」
+/// 门禁的口径。字段缺失或形态不对就当没读到，交给常量兜底，绝不编一个值发出去。
+fn product_version_from_install_dir(dir: &Path) -> Option<ClientProductVersion> {
+    let relative_candidates: &[&[&str]] = &[
+        &["resources", "app", "product.json"],
+        &["Contents", "Resources", "app", "product.json"],
+    ];
+    for relative in relative_candidates {
+        let path = relative.iter().fold(dir.to_path_buf(), |acc, part| acc.join(part));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let field = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let (Some(ide_version), Some(build_date)) = (field("appVersion"), field("date")) else {
+            continue;
+        };
+        let Some(version_code) = version_code_from_build_date(&build_date) else {
+            continue;
+        };
+        return Some(ClientProductVersion {
+            ide_version,
+            version_code,
+        });
+    }
+    None
+}
+
+/// `product.json` 的 `date`（`2026-10-28T09:47:39.271Z`）→ 版本码 `20261028`。
+///
+/// 上游按「构建日期」的数值做**最低版本**门禁（2026-10-30 实测：`20250325` 被
+/// `4001 param is invalid` 拒，`20260811` / `20261028` 均通过）；形态不对就返回
+/// `None`，交给调用方回落常量 —— 绝不编一个看似合理的值发出去。
+fn version_code_from_build_date(date: &str) -> Option<String> {
+    let head = date.trim().get(..10)?; // `2026-10-28`
+    let mut parts = head.split('-');
+    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    if parts.next().is_some() || year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return None;
+    }
+    if !year
+        .chars()
+        .chain(month.chars())
+        .chain(day.chars())
+        .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("{year}{month}{day}"))
 }
 
 /// 客户端在上游眼里的「系统信息」。
@@ -3128,5 +3266,55 @@ mod tests {
                 "{region:?} 解析出 {resolved:?}，但它既没装、也没有数据目录、也不是该区域的首选程序位兜底"
             );
         }
+    }
+
+    /// ★★ 护栏：版本码只从 `product.json` 的 `date` 推导（`YYYYMMDD`）。
+    ///
+    /// 反例（改坏会红，2026-10-30 上游实测）：
+    /// - 拿 `traeVersionCode`（`20250325`）当版本码 ⇒ 低于上游最低版本门禁，
+    ///   全部模型回 `4001 param is invalid`（13/13 实测）；
+    /// - 拿 `tronBuildVersion`（`2.3.98528`）当版本码 ⇒ 带点，binding 阶段直接 400。
+    ///
+    /// 纯路径读取，**不碰** `settings` / `BUDDY_SWITCH_HOME`，因此无需 `env_lock()`。
+    #[test]
+    fn product_version_derives_code_from_build_date() {
+        let root =
+            std::env::temp_dir().join(format!("trae-product-version-{}", std::process::id()));
+        let app = root.join("resources").join("app");
+        std::fs::create_dir_all(&app).expect("创建临时安装目录");
+        let write =
+            |json: &str| std::fs::write(app.join("product.json"), json).expect("写入 product.json");
+
+        // 正常形态：版本码取 `date` 的 YYYYMMDD；同场的 `traeVersionCode` 不算数。
+        write(
+            r#"{"appVersion":"3.4.11","date":"2026-10-28T09:47:39.271Z","traeVersionCode":"20250325","tronBuildVersion":"2.3.98528"}"#,
+        );
+        assert_eq!(
+            product_version_from_install_dir(&root),
+            Some(ClientProductVersion {
+                ide_version: "3.4.11".into(),
+                version_code: "20261028".into(),
+            })
+        );
+
+        // 只有 `traeVersionCode`、没有 `date` ⇒ 读不到（不许拿 20250325 顶替）。
+        write(r#"{"appVersion":"3.4.11","traeVersionCode":"20250325"}"#);
+        assert_eq!(
+            product_version_from_install_dir(&root),
+            None,
+            "不得拿 traeVersionCode 顶替版本码"
+        );
+
+        // `date` 形态不对 ⇒ 读不到（宁可回落常量，也不给上游发一个必被拒的值）。
+        write(r#"{"appVersion":"3.4.11","date":"latest"}"#);
+        assert_eq!(product_version_from_install_dir(&root), None, "非法 date 必须被拒");
+
+        // 缺 `appVersion` ⇒ 同样不可用。
+        write(r#"{"date":"2026-10-28T09:47:39.271Z"}"#);
+        assert_eq!(product_version_from_install_dir(&root), None);
+
+        // 文件不存在（≈ 本机没装客户端）⇒ `None`。
+        std::fs::remove_dir_all(&root).expect("清理临时目录");
+        assert_eq!(product_version_from_install_dir(&root), None);
     }
 }
