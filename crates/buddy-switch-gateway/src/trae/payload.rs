@@ -1507,6 +1507,7 @@ mod tests {
             "u1",
             "dev1",
             "mach1",
+            false,
         ))
         .unwrap();
         assert_eq!(cn_out["package_type"], "stable_cn");
@@ -1520,6 +1521,7 @@ mod tests {
             "u1",
             "dev1",
             "mach1",
+            false,
         ))
         .unwrap();
         assert_eq!(global_out["package_type"], "stable_i18n");
