@@ -56,12 +56,14 @@ const state = {
   gwSub: "overview",
   gwApi: "openai",      // 快速接入的协议 Tab：openai / anthropic
   gwScanning: false,    // 模型清单「识别中」（§3.17）
-  /* 模型降级链（P13）：`fbDraft` = 抽屉里正在编辑的草稿；`fbEvents` = 流水是否展开。
+  /* 模型降级链（P13）：`fbDraft` = 抽屉里正在编辑的草稿；`fbEvents` = 流水是否展开；
+     `fbOpen` = 卡片是否展开（默认收起，与「限流探测」卡同形态）。
      ★ 草稿与已存配置**分开**：抽屉里改了没保存就关掉，不能污染配置。
      ★ 重开抽屉时必须**保留**已有草稿（切触发条件 / 换备选都要重开刷新），
        从配置重建会把用户刚做的改动冲掉 —— 见 `openFbDrawer` 的 `same` 判断。 */
   fbDraft: null,
   fbEvents: false,
+  fbOpen: false,
   /* Trae 上下文策略（Max Mode）：always = 支持表内模型始终注入 is_max_mode；off = 回到上游默认窗口。
      Max Mode 是**请求级开关**，不是模型 —— 所以清单里一个模型只有一条记录，没有 `-max` 影子 id。 */
   maxMode: "always",
@@ -108,8 +110,13 @@ const state = {
   gwRoll: {},
   /* 「模拟请求」产出的换号链路（步骤数组）。任何池状态变更都会清空它，避免陈旧的假链路。{ [scope]: step[] } */
   gwChain: {},
-  /* 「免费号不可用时允许用收费号」：**默认关**（与「不偷偷花积分」的安全默认同源）。{ [scope]: bool } */
+  /* 「免费号不可用时允许用收费号」：**默认关**（与「不偷偷花积分」的安全默认同源）。{ [scope]: bool }
+     ★ issue #129：`gwAutoFailover` 按**产品线**存（`wb` / `trae` / `qoder`），不是按 scope ——
+     真实实现就是三份配置各一个同名布尔，WB 的两个版本 Tab 共用同一个值。
+     演示里也按产品线取，否则「切到国际版发现开关自己变了」会演成一个不存在的 bug。 */
   gwPayFallback: {},
+  /* 「账号故障时自动切换」（issue #129）：**默认关**（改变对外报错语义 = 行为变更）。{ [platform]: bool } */
+  gwAutoFailover: {},
   /* 密钥表「行内展开」：当前展开了哪把密钥的明细（null = 都收起）。
      ★ 一次只展开一行 —— 展开区是「低头看详情」，同时展开三行就把一览表毁掉了。
      纯本地状态，不发请求；点同一行再点一次即收起。 */
@@ -2307,6 +2314,7 @@ function fallbackCard(g) {
     <div class="grow"></div>
     <span class="tiny muted">同作用域 · 最多 2 跳</span>
     <button class="btn sm ghost" data-act="fb-events">${state.fbEvents ? "收起流水" : "降级流水"}</button>
+    <button class="btn sm ghost" data-act="fb-toggle-open" aria-expanded="${state.fbOpen}">${state.fbOpen ? "收起" : "展开"}</button>
   </div>`;
 
   /* 恒定明示：这两句必须一直在，不能塞进 tooltip ——
@@ -2364,14 +2372,18 @@ function fallbackCard(g) {
 
   const events = state.fbEvents ? fbEventsHtml(fb) : "";
 
-  return `<section class="card" style="margin-bottom:16px">
-    ${head}${notice}${bar}
+  /* 折叠只收配置区：标题 / 徽标 / 恒定明示留在卡头 ——「会不会偷偷换模型」是这张卡的
+     身份，不能随配置一起折掉（与「限流探测」卡同口径）。 */
+  const body = state.fbOpen ? `${bar}
     ${fb.chains.length ? `<div class="fb-list">${rows}</div>
       <p class="tiny muted" style="margin:0;padding:10px 16px 12px;line-height:1.7">
         状态点读的是<b>实时</b>闸门与冷却（与账号池同源），不是配置快照。降级成功后主模型的闸门<b>不解除</b> ——
         它确实失败了；闸门到期后请求自然回到主模型，无需「回切」开关。
       </p>` : empty}
-    ${events}
+    ${events}` : "";
+
+  return `<section class="card" style="margin-bottom:16px">
+    ${head}${notice}${body}
   </section>`;
 }
 
@@ -3515,14 +3527,9 @@ function dur(sec) {
 /** 互斥五态徽标（已排除 / 冷却 / 禁用 / 零积分 / 可用）。
  *  ★ 五态**逐条相加 = 条目数**，所以「可用」里绝不能再混进已排除的号 ——
  *  否则卡片说「4 可用」，用户却只能选中 3 个，数字与事实不符。 */
-function poolStateBadge(x) {
-  if (x.excluded) return `<span class="badge bad">已排除</span>`;
-  if (x.state === "冷却") return `<span class="badge warn">冷却</span>`;
-  if (x.state === "禁用") return `<span class="badge bad">禁用</span>`;
-  if (x.state === "零积分") return `<span class="badge warn">零积分</span>`;
-  return `<span class="badge ok">可用</span>`;
-}
-
+/* ★ 这里曾有一份**逐字重复**的 `poolStateBadge` 声明（2026-10-30 删除）：
+   脚本作用域里同名 `function` 重复声明是 **SyntaxError** ⇒ 整份原型在浏览器里
+   一行都不执行（页面只剩静态骨架）。门禁只做文本匹配，所以一直没红。 */
 /** 本次「演示请求」用的模型：模型闸门的模型 > 第一个可用模型。
  *  ★ 不再给下拉选择：模型是**请求**的属性，不是网关的配置项。
  *  把它做成池卡上的选择器，会让人以为「网关有一个全局模型设置」—— 那是假控件。 */
@@ -3738,6 +3745,8 @@ function poolSection(g) {
   const mode = gwModeOf(scope);
   const pinned = mode === "pinned" ? state.pins[scope] || null : null;
   const payFallback = !!state.gwPayFallback[scope];
+  /* ★ issue #129：按**产品线**取（见 `gwAutoFailover` 的注释）——WB 两个版本共用一份。 */
+  const autoFailover = !!state.gwAutoFailover[curScope().platform];
   const seed = state.gwRoll[scope] || 1;
   const c = poolCounts(g);
   const v = poolVerdict(g, model, { payFallback, mode, seed });
@@ -3800,6 +3809,9 @@ function poolSection(g) {
       <span class="tiny muted">收费号兜底</span>
       <button class="switch${payFallback ? " on" : ""}" data-act="pool-payfallback"
         role="switch" aria-checked="${payFallback}" aria-label="允许用收费号兜底"></button>
+      <span class="tiny muted" title="一个账号在回复中途挂掉时，把这次失败变成「客户端可重试的错误」：客户端自动换号重跑整个步骤，你看到的是从头完整重写的回复。代价：已输出的部分作废、这一步再消耗一次额度。默认关 —— 它改变对外报错语义，属于行为变更。">账号故障时自动切换</span>
+      <button class="switch${autoFailover ? " on" : ""}" data-act="pool-autofailover"
+        role="switch" aria-checked="${autoFailover}" aria-label="账号故障时自动切换"></button>
     </div>
     <div class="kpi-row">${tiles
       .map((t) => `<div class="${t.tone}"><b>${t.n}</b><span>${t.k}</span></div>`)
@@ -6638,7 +6650,8 @@ document.addEventListener("click", (e) => {
         fb.enabled ? "主模型明确失败时会按链改用备选" : "配置保留，但一次都不会触发");
       break;
     }
-    case "fb-events": stop(); state.fbEvents = !state.fbEvents; renderContent(); break;
+    case "fb-events": stop(); state.fbOpen = true; state.fbEvents = !state.fbEvents; renderContent(); break;
+    case "fb-toggle-open": stop(); state.fbOpen = !state.fbOpen; renderContent(); break;
     case "fb-new": stop(); openFbDrawer(null); break;
     case "fb-edit": stop(); openFbDrawer(a1); break;
     case "fb-chain-toggle": {
@@ -6924,6 +6937,24 @@ document.addEventListener("click", (e) => {
         delete row.excludedNote;
         toast("ok", `已取消排除 ${row.account}`, "下一轮请求起重新参与选号");
       }
+      state.gwChain[state.scope] = null;
+      renderContent();
+      break;
+    }
+    case "pool-autofailover": {
+      stop();
+      /* 按**产品线**存（真实实现就是三份 config 各一个同名布尔）——WB 的两个版本 Tab 共用一个值，
+         否则「切到国际版开关自己变了」会被演成一个不存在的 bug。 */
+      const platform = curScope().platform;
+      state.gwAutoFailover[platform] = !state.gwAutoFailover[platform];
+      const on = state.gwAutoFailover[platform];
+      toast(
+        on ? "ok" : "info",
+        on ? "已开启：账号故障时自动切换" : "已关闭：账号故障时自动切换",
+        on
+          ? "回复中途账号挂掉 ⇒ 网关发一条可重试错误（429 / 502），客户端自动换号重跑这一步，你会看到回复从头重写"
+          : "回到改造前的行为：上游报错按原样透出（流中途失败仍会被补终止标记）"
+      );
       state.gwChain[state.scope] = null;
       renderContent();
       break;

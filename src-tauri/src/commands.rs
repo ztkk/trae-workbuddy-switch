@@ -3213,7 +3213,8 @@ pub async fn save_model_fallback(scope: String, config: Value) -> Result<Value, 
 
     // 规范化：**在写盘之前**把脏值挡掉（丢掉空 from、剔除与主模型同名的 target、
     // 去重后截断到上限）。逻辑在 gateway crate 里，与 WebUI 那条路**共用同一份**。
-    let normalized = buddy_switch_gateway::model_fallback::normalize(parsed);
+    // 传 `scope`：「同名即自环」只在同作用域成立（跨区域同名是另一个上游）。
+    let normalized = buddy_switch_gateway::model_fallback::normalize(scope, parsed);
 
     let store = buddy_switch_gateway::model_fallback::shared();
     {
@@ -5417,6 +5418,17 @@ pub async fn qoder_web_session_status(scope: String, uid: String) -> Result<Valu
     crate::qoder_web::session_status(scope, uid).await
 }
 
+/// GET /api/qoder/web/session/window-cookies —— 登录窗里现有的 Cookie **名称与条数**（只读、不打上游）。
+///
+/// 前端轮询它来发现「用户已经在窗口里登录完了」（`fingerprint` 变化）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_web_window_cookies(
+    app: tauri::AppHandle,
+    scope: String,
+) -> Result<Value, String> {
+    crate::qoder_web::window_cookies(&app, scope).await
+}
+
 /// GET /api/qoder/web/credit-packs —— 读**已缓存**会话取逐包明细（渲染用，不弹窗）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn qoder_web_credit_packs(scope: String, uid: String) -> Result<Value, String> {
@@ -5427,6 +5439,20 @@ pub async fn qoder_web_credit_packs(scope: String, uid: String) -> Result<Value,
 #[tauri::command(rename_all = "camelCase")]
 pub async fn qoder_web_session_logout(scope: String) -> Result<Value, String> {
     crate::qoder_web::session_logout(scope).await
+}
+
+/// GET /api/qoder/web/proxy —— 读出站代理配置（逐包取数用；空 = 直连）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_web_proxy_get() -> Result<Value, String> {
+    crate::qoder_web::web_proxy_config()
+}
+
+/// POST /api/qoder/web/proxy —— 保存出站代理配置（两个字段都先过形状校验）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn qoder_web_proxy_set(config: Value) -> Result<Value, String> {
+    let parsed: buddy_switch_core::modules::qoder::web_proxy::WebProxyConfig =
+        serde_json::from_value(config).map_err(|error| format!("代理配置格式错误: {error}"))?;
+    crate::qoder_web::web_proxy_config_save(parsed)
 }
 
 /// POST /api/qoder/pro-pack/claim —— 领取 Pro 升级包（幂等；已领过 `already=true`）。
