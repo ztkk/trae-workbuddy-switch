@@ -30,7 +30,7 @@ const path = require("node:path");
 /* ★ 前置：Node 版本。`jsdom 30` 依赖 `undici 8`，后者 `engines` 要求 **Node ≥ 22.19** ——
    版本不够时 12 个套件会同时崩在 `undici/lib/interceptor/decompress.js`（`reading 'bind'`），
    看起来像「断言全错」，实际是运行时太老。这里提前用一句话说清，别再让人去翻栈。 */
-const NODE_MIN = [22, 19, 0];
+const NODE_MIN = [22, 18, 0];
 const current = process.versions.node.split(".").map((part) => Number(part));
 const tooOld =
   current[0] < NODE_MIN[0] ||

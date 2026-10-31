@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   BuddySwitch 一键打包 —— Windows NSIS 安装包（.exe）。
 
